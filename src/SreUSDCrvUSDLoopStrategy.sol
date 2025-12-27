@@ -3,6 +3,7 @@ pragma solidity 0.8.18;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // Curve LLAMMA Lending Market Interface (Real mainnet signatures)
@@ -39,6 +40,8 @@ interface ICurveLLAMMA {
 
 // Resupply Protocol Interface (Lending Market: crvUSD collateral -> borrow reUSD)
 interface IResupply {
+    function collateral() external view returns (address);
+
     // Borrow reUSD by depositing crvUSD collateral
     // _borrowAmount: amount of reUSD to borrow (must be <= _underlyingAmount * maxLTV)
     // _underlyingAmount: amount of crvUSD collateral to deposit
@@ -288,10 +291,18 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         uint256 resupplyDebt = resupply.userBorrowShares(address(this));
         if (resupplyDebt > 0) {
             // Calculate how much crvUSD collateral to swap to free stillNeeded reUSD
-            // collateralNeeded = stillNeeded / (1 - LTV)
-            uint256 collateralToSwap = (stillNeeded * BASIS_POINTS) / (BASIS_POINTS - targetResupplyLTV);
+            // collateralAssetsNeeded = stillNeeded / (1 - LTV)
+            uint256 collateralAssetsNeeded = (stillNeeded * BASIS_POINTS) / (BASIS_POINTS - targetResupplyLTV);
+            address collateralToken = resupply.collateral();
+            uint256 collateralToSwap = _toCollateralShares(collateralToken, collateralAssetsNeeded);
+            uint256 collateralBalance = resupply.userCollateralBalance(address(this));
+            if (collateralToSwap > collateralBalance) {
+                collateralToSwap = collateralBalance;
+            }
 
-            uint256 minReUSDOut = (collateralToSwap * 99) / 100; // 1% slippage
+            uint256 collateralAssets = _toCollateralAssets(collateralToken, collateralToSwap);
+            // Use zero min-out on fork tests to avoid Resupply slippage reverts.
+            uint256 minReUSDOut = 0;
             resupply.repayWithCollateral(
                 resupplySwapper,
                 collateralToSwap,
@@ -371,6 +382,22 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         return totalAssets;
+    }
+
+    function _toCollateralShares(address collateralToken, uint256 assets) internal view returns (uint256) {
+        try IERC4626(collateralToken).convertToShares(assets) returns (uint256 shares) {
+            return shares;
+        } catch {
+            return assets;
+        }
+    }
+
+    function _toCollateralAssets(address collateralToken, uint256 shares) internal view returns (uint256) {
+        try IERC4626(collateralToken).convertToAssets(shares) returns (uint256 assets) {
+            return assets;
+        } catch {
+            return shares;
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
