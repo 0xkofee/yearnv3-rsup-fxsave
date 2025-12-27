@@ -3,7 +3,7 @@ src = 'src'
 out = 'out'
 libs = ['lib']
 solc = "0.8.18"
-evm_version = "paris"
+evm_version = "cancun"
 
 remappings = [
     'forge-std/=lib/forge-std/src/',
@@ -18,3 +18,7 @@ max_test_rejects = 1_000_000
 [invariant]
 runs = 100
 depth = 100
+
+# RPC endpoints for fork testing
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"

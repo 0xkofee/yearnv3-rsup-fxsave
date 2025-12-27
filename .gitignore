@@ -17,3 +17,21 @@ docs/
 node_modules/
 .gas-snapshot
 lcov.info
+
+# Test output
+*.log
+test_output.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+coverage.json

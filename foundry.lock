@@ -1,0 +1,20 @@
+{
+  "lib/erc4626-tests": {
+    "branch": {
+      "name": "main",
+      "rev": "8b1d7c2ac248c33c3506b1bff8321758943c5e11"
+    }
+  },
+  "lib/forge-std": {
+    "branch": {
+      "name": "v1.5.2",
+      "rev": "2b58ecbcf3dfde7a75959dc7b4eb3d0670278de6"
+    }
+  },
+  "lib/openzeppelin-contracts": {
+    "branch": {
+      "name": "v4.9.5",
+      "rev": "bd325d56b4c62c9c5c1aff048c37c6bb18ac0290"
+    }
+  }
+}

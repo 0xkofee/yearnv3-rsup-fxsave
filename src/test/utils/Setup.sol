@@ -48,8 +48,14 @@ contract Setup is ExtendedTest, IEvents {
         // Deploy the mock factory first for deterministic location
         mockFactory = new MockFactory(0, protocolFeeRecipient);
 
-        // Deploy the implementation for deterministic location
-        tokenizedStrategy = new TokenizedStrategy(address(mockFactory));
+        // Deploy TokenizedStrategy and etch it to the mainnet address for testing
+        TokenizedStrategy implementation = new TokenizedStrategy(address(mockFactory));
+
+        // Etch the code to the mainnet TokenizedStrategy address
+        vm.etch(0xD377919FA87120584B21279a491F82D5265A139c, address(implementation).code);
+
+        // Reference it at the mainnet address
+        tokenizedStrategy = TokenizedStrategy(0xD377919FA87120584B21279a491F82D5265A139c);
 
         // create asset we will be using as the underlying asset
         asset = new ERC20Mock();
