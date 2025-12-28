@@ -112,41 +112,13 @@ contract MockCurveLLAMMA {
         }
     }
 
-    function repay(uint256 _d_debt, address _for, int256 max_active_band, address _callbacker, bytes calldata, bool shrink) external {
+    function repay(uint256 _d_debt, address _for, int256 /* max_active_band */) external {
         require(loans[_for].exists, "No loan");
 
-        if (_callbacker != address(0)) {
-            // Repay with collateral via callback (Zap pattern)
-            // 1. Calculate how much collateral needed to repay debt
-            //    Assume 1:1 sreUSD:crvUSD for simplicity
-            uint256 collateralNeeded = _d_debt;
-
-            require(loans[_for].collateral >= collateralNeeded, "Insufficient collateral");
-
-            // 2. Send collateral to Zap
-            collateralToken.transfer(_callbacker, collateralNeeded);
-
-            // 3. Zap swaps sreUSD → crvUSD and returns it
-            // (In mock, we just burn the debt and assume swap happened)
-            borrowedToken.mint(address(this), _d_debt);
-            borrowedToken.burn(address(this), _d_debt);
-
-            // 4. Update loan
-            loans[_for].collateral -= collateralNeeded;
-            loans[_for].debt -= _d_debt;
-
-            // 5. Return leftover crvUSD to user (over-collateralization)
-            // In reality, if collateral was worth more than debt, Zap returns extra
-            // For simplicity, we send back a small amount
-            if (loans[_for].collateral > 0) {
-                borrowedToken.mint(_for, collateralNeeded / 100); // 1% leftover
-            }
-        } else {
-            // Normal repay: user sends crvUSD directly
-            borrowedToken.transferFrom(msg.sender, address(this), _d_debt);
-            borrowedToken.burn(address(this), _d_debt);
-            loans[_for].debt -= _d_debt;
-        }
+        // Normal repay: user sends crvUSD directly
+        borrowedToken.transferFrom(msg.sender, address(this), _d_debt);
+        borrowedToken.burn(address(this), _d_debt);
+        loans[_for].debt -= _d_debt;
     }
 
     function add_collateral(uint256 collateral) external {
@@ -243,6 +215,11 @@ contract MockResupply {
         underlying = ERC20Mock(_underlying);
         borrowToken = ERC20Mock(_borrowToken);
         swapper = _swapper;
+    }
+
+    // Returns the collateral token address
+    function collateral() external view returns (address) {
+        return address(underlying);
     }
 
     function borrow(

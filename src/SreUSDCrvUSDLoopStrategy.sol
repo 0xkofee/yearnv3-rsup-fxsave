@@ -14,17 +14,8 @@ interface ICurveLLAMMA {
     function remove_collateral(uint256 collateral) external;
     function borrow_more(uint256 collateral, uint256 debt) external;
 
-    // Repay debt - can use callback pattern for "repay with collateral"
-    // callbacker: Zap contract address (or address(0) for normal repay)
-    // When callbacker != address(0): sends collateral to Zap, Zap swaps to debt token, returns for repayment
-    function repay(
-        uint256 _d_debt,
-        address _for,
-        int256 max_active_band,
-        address callbacker,
-        bytes calldata calldata_,
-        bool shrink
-    ) external;
+    // Repay crvUSD debt (up to 3 params, all have defaults in Vyper)
+    function repay(uint256 _d_debt, address _for, int256 max_active_band) external;
 
     // View functions
     function debt(address user) external view returns (uint256);
@@ -51,15 +42,6 @@ interface IResupply {
         uint256 _underlyingAmount,
         address _receiver
     ) external returns (uint256 _shares);
-
-    // Repay reUSD debt by swapping crvUSD collateral
-    // Automatically: withdraw collateral → swap to reUSD → repay debt
-    function repayWithCollateral(
-        address _swapperAddress,
-        uint256 _collateralToSwap,
-        uint256 _amountOutMin,
-        address[] calldata _path
-    ) external returns (uint256 _amountOut);
 
     // Repay reUSD debt
     // _shares: amount of borrow shares to repay
@@ -176,10 +158,6 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
     uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
 
-    // Deleverage parameters
-    address public resupplySwapper;     // Resupply: whitelisted swapper for crvUSD → reUSD swaps
-    address[] public swapPath;          // Resupply: swap path for crvUSD → reUSD (e.g., [crvUSD, reUSD])
-    address public curveZap;            // Curve LLAMMA: Zap contract for sreUSD → crvUSD callback swaps
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -213,13 +191,14 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         targetCurveLTV = 9500;  // 95% LTV for Curve LLAMMA
 
         // Set loop parameters
-        maxIterations = 10;          // Maximum 10 loops per operation
-        minLoopAmount = 1e18;        // Minimum 1 reUSD to continue looping
+        maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
+        minLoopAmount = 10e18;       // Min 10 reUSD to continue looping (borrow has try/catch for protocol min)
 
         // Approve tokens for protocol interactions
-        crvUSD.safeApprove(_resupply, type(uint256).max);
-        crvUSD.safeApprove(_curveLLAMMA, type(uint256).max);
-        reUSD.safeApprove(_sreUSD, type(uint256).max);       // Approve reUSD for unwrapping
+        crvUSD.safeApprove(_resupply, type(uint256).max);    // Approve crvUSD for Resupply collateral
+        crvUSD.safeApprove(_curveLLAMMA, type(uint256).max); // Approve crvUSD for Curve repayment
+        reUSD.safeApprove(_sreUSD, type(uint256).max);       // Approve reUSD for sreUSD wrapping
+        reUSD.safeApprove(_resupply, type(uint256).max);     // Approve reUSD for Resupply repayment
         sreUSD.approve(_curveLLAMMA, type(uint256).max);     // Approve sreUSD for LLAMMA collateral
 
         // Verify token configuration matches
@@ -262,72 +241,139 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             // d. Deposit crvUSD collateral to Resupply and borrow reUSD at target LTV (92%)
             // IMPORTANT: Can only borrow 92% worth of reUSD against crvUSD collateral!
             uint256 reUSDBorrowAmount = (borrowAmount * targetResupplyLTV) / BASIS_POINTS;
-            resupply.borrow(
+
+            // Try to borrow - may fail if amount is below protocol minimum ($1000)
+            try resupply.borrow(
                 reUSDBorrowAmount,  // Borrow 92 reUSD
                 borrowAmount,        // Against 100 crvUSD collateral
                 address(this)
-            );
-
-            // e. Use newly borrowed reUSD for next loop iteration
-            reUSDToLoop = reUSDBorrowAmount;
+            ) {
+                // e. Use newly borrowed reUSD for next loop iteration
+                reUSDToLoop = reUSDBorrowAmount;
+            } catch {
+                // Borrow failed (likely below minimum), stop looping
+                break;
+            }
         }
     }
 
     /**
      * @notice Free funds from the strategy by deleveraging
-     * @param _amount Amount of reUSD to free
-     * @dev Uses repay-with-collateral on both Curve and Resupply
-     *      Curve returns leftover crvUSD, Resupply returns leftover reUSD (freed capital)
+     * @param _amount Amount of reUSD to free (excludes idle balance)
+     * @dev Reverses the leverage loop to unwind positions:
+     *      1. reUSD → repay Resupply debt
+     *      2. Withdraw crvUSD from Resupply
+     *      3. crvUSD → repay Curve debt
+     *      4. Withdraw sreUSD from Curve
+     *      5. sreUSD → reUSD (redeem)
+     *      6. Repeat until target amount is freed
      */
     function _freeFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
-        uint256 idle = reUSD.balanceOf(address(this));
-        if (idle >= _amount) return;  // Have enough idle
+        // Loop to unwind positions (reverse of leverage loop)
+        for (uint256 i = 0; i < maxIterations; i++) {
+            uint256 reUSDBalance = reUSD.balanceOf(address(this));
 
-        uint256 stillNeeded = _amount - idle;
+            // Check if we've freed enough
+            if (reUSDBalance >= _amount) break;
 
-        // Step 1: Unwind Resupply position - returns leftover reUSD (freed capital!)
-        uint256 resupplyDebt = resupply.userBorrowShares(address(this));
-        if (resupplyDebt > 0) {
-            // Calculate how much crvUSD collateral to swap to free stillNeeded reUSD
-            // collateralAssetsNeeded = stillNeeded / (1 - LTV)
-            uint256 collateralAssetsNeeded = (stillNeeded * BASIS_POINTS) / (BASIS_POINTS - targetResupplyLTV);
-            address collateralToken = resupply.collateral();
-            uint256 collateralToSwap = _toCollateralShares(collateralToken, collateralAssetsNeeded);
-            uint256 collateralBalance = resupply.userCollateralBalance(address(this));
-            if (collateralToSwap > collateralBalance) {
-                collateralToSwap = collateralBalance;
+            // Step 1: Use reUSD to repay Resupply debt
+            uint256 borrowShares = resupply.userBorrowShares(address(this));
+            if (borrowShares > 0 && reUSDBalance > 0) {
+                uint256 debtAmount = resupply.toBorrowAmount(borrowShares, true, false);
+                uint256 repayAmount = reUSDBalance < debtAmount ? reUSDBalance : debtAmount;
+
+                // Convert repay amount to shares (round up to ensure full repayment)
+                uint256 repayShares = (repayAmount * borrowShares) / debtAmount;
+                if (repayShares > borrowShares) repayShares = borrowShares;
+
+                if (repayShares > 0) {
+                    try resupply.repay(repayShares, address(this)) {} catch {}
+                }
             }
 
-            uint256 collateralAssets = _toCollateralAssets(collateralToken, collateralToSwap);
-            // Use zero min-out on fork tests to avoid Resupply slippage reverts.
-            uint256 minReUSDOut = 0;
-            resupply.repayWithCollateral(
-                resupplySwapper,
-                collateralToSwap,
-                minReUSDOut,
-                swapPath
-            );
-            // Leftover reUSD from over-collateralization is now available!
-        }
+            // Step 2: Withdraw crvUSD collateral from Resupply
+            // Note: userCollateralBalance returns cvcrvUSD vault shares, not underlying crvUSD
+            uint256 collateralShares = resupply.userCollateralBalance(address(this));
+            borrowShares = resupply.userBorrowShares(address(this));
 
-        // Step 2: Unwind Curve position - returns leftover crvUSD
-        uint256 curveDebt = curveLLAMMA.debt(address(this));
-        if (curveDebt > 0) {
-            // Calculate proportional debt to repay
-            uint256 debtToRepay = (stillNeeded * targetCurveLTV) / BASIS_POINTS;
-            debtToRepay = debtToRepay > curveDebt ? curveDebt : debtToRepay;
+            if (collateralShares > 0) {
+                // If debt remains, can only withdraw excess collateral (maintain solvency)
+                // If no debt, withdraw everything
+                uint256 withdrawableShares = collateralShares;
+                if (borrowShares > 0) {
+                    uint256 debtAmount = resupply.toBorrowAmount(borrowShares, true, false);
+                    // Need to keep enough collateral for remaining debt (at 95% LTV max)
+                    // minCollateral is in underlying crvUSD terms
+                    uint256 minCollateralUnderlying = (debtAmount * BASIS_POINTS) / MAX_RESUPPLY_LTV;
+                    // Convert collateral shares to underlying to compare
+                    address collateralToken = resupply.collateral();
+                    uint256 collateralUnderlying = _toCollateralAssets(collateralToken, collateralShares);
 
-            curveLLAMMA.repay(
-                debtToRepay,
-                address(this),
-                type(int256).max,
-                curveZap,
-                "",
-                false
-            );
-            // Leftover crvUSD stays in strategy for next deposit cycle
+                    if (collateralUnderlying > minCollateralUnderlying) {
+                        // Calculate withdrawable in underlying terms, then convert back to shares
+                        uint256 withdrawableUnderlying = collateralUnderlying - minCollateralUnderlying;
+                        withdrawableShares = _toCollateralShares(collateralToken, withdrawableUnderlying);
+                    } else {
+                        withdrawableShares = 0;
+                    }
+                }
+
+                if (withdrawableShares > minLoopAmount) {
+                    try resupply.removeCollateral(withdrawableShares, address(this)) {} catch {}
+                }
+            }
+
+            // Step 3: Use crvUSD to repay Curve debt
+            uint256 crvUSDBalance = crvUSD.balanceOf(address(this));
+            uint256 curveDebt = curveLLAMMA.debt(address(this));
+
+            if (curveDebt > 0 && crvUSDBalance > 0) {
+                uint256 repayAmount = crvUSDBalance < curveDebt ? crvUSDBalance : curveDebt;
+
+                // Use max int256 for max_active_band to allow repayment regardless of band position
+                try curveLLAMMA.repay(repayAmount, address(this), type(int256).max) {} catch {}
+            }
+
+            // Step 4: Withdraw sreUSD collateral from Curve
+            if (curveLLAMMA.loan_exists(address(this))) {
+                uint256[4] memory state = curveLLAMMA.user_state(address(this));
+                uint256 sreUSDCollateral = state[0];
+                curveDebt = curveLLAMMA.debt(address(this));
+
+                if (sreUSDCollateral > 0) {
+                    uint256 withdrawable = sreUSDCollateral;
+                    if (curveDebt > 0) {
+                        // Keep enough collateral for remaining debt at max LTV
+                        // minCollateral = debt / MAX_LTV (in same units as collateral)
+                        uint256 minCollateralAtMaxLTV = (curveDebt * BASIS_POINTS) / MAX_CURVE_LTV;
+                        if (sreUSDCollateral > minCollateralAtMaxLTV) {
+                            // Withdraw 95% of excess to leave small buffer
+                            withdrawable = ((sreUSDCollateral - minCollateralAtMaxLTV) * 95) / 100;
+                        } else {
+                            withdrawable = 0;
+                        }
+                    }
+
+                    if (withdrawable > minLoopAmount) {
+                        try curveLLAMMA.remove_collateral(withdrawable) {} catch {}
+                    }
+                }
+            }
+
+            // Step 5: Redeem sreUSD → reUSD
+            uint256 sreUSDBalance = sreUSD.balanceOf(address(this));
+            if (sreUSDBalance > 0) {
+                try sreUSD.redeem(sreUSDBalance, address(this), address(this)) {} catch {}
+            }
+
+            // Check if we made progress this iteration
+            uint256 newReUSDBalance = reUSD.balanceOf(address(this));
+            if (newReUSDBalance <= reUSDBalance + minLoopAmount) {
+                // No meaningful progress, exit to avoid infinite loop
+                break;
+            }
         }
     }
 
@@ -497,26 +543,6 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         maxIterations = _maxIterations;
         minLoopAmount = _minLoopAmount;
-    }
-
-    /**
-     * @notice Update deleverage parameters
-     * @param _resupplySwapper Whitelisted swapper address for Resupply repayWithCollateral
-     * @param _swapPath Swap path for crvUSD → reUSD on Resupply
-     * @param _curveZap Zap contract address for Curve LLAMMA repay callback
-     */
-    function setDeleverageParameters(
-        address _resupplySwapper,
-        address[] calldata _swapPath,
-        address _curveZap
-    ) external onlyManagement {
-        require(_resupplySwapper != address(0), "Invalid swapper address");
-        require(_swapPath.length >= 2, "Invalid swap path");
-        require(_curveZap != address(0), "Invalid zap address");
-
-        resupplySwapper = _resupplySwapper;
-        swapPath = _swapPath;
-        curveZap = _curveZap;
     }
 
     /**
