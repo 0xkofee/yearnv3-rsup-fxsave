@@ -2,7 +2,6 @@
 pragma solidity 0.8.18;
 
 import "forge-std/Test.sol";
-import "forge-std/console.sol";
 
 interface IResupply {
     function borrow(
@@ -30,26 +29,24 @@ contract DebugTest is Test {
     }
 
     function testDebugBorrow() public {
-        console.log("RESUPPLY_PAIR address:", RESUPPLY_PAIR);
-        
+        emit log_named_address("RESUPPLY_PAIR address", RESUPPLY_PAIR);
+
         // Deal crvUSD
         deal(CRVUSD, address(this), 1000e18);
         IERC20(CRVUSD).approve(RESUPPLY_PAIR, type(uint256).max);
 
         // Try borrow
         // Borrow 1 reUSD against 10 crvUSD (just valid params hopefully)
-        // Need to know LTV to be safe. 
+        // Need to know LTV to be safe.
         // Strategy uses 92% LTV.
         // If I use small borrow amount it should be fine.
-        
+
         try IResupply(RESUPPLY_PAIR).borrow(1e18, 10e18, address(this)) {
-            console.log("Borrow success");
+            emit log("Borrow success");
         } catch Error(string memory reason) {
-            console.log("Borrow failed with reason:", reason);
-        } catch (bytes memory lowLevelData) {
-            console.log("Borrow failed with low level data");
-            // Check if it matches NotActivated selector?
-            // console.logBytes(lowLevelData);
+            emit log_named_string("Borrow failed with reason", reason);
+        } catch (bytes memory) {
+            emit log("Borrow failed with low level data");
         }
     }
 }

@@ -185,6 +185,11 @@ contract MockCurveLLAMMA {
     function borrowed_token() external view returns (address) {
         return address(borrowedToken);
     }
+
+    function loan_discount() external pure returns (uint256) {
+        // 2% discount = 98% max LTV (matches mainnet)
+        return 2e16;
+    }
 }
 
 /**

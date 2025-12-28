@@ -146,13 +146,16 @@ contract LoopStrategyForkTest is Test {
         vm.stopPrank();
 
         uint256 initialAssets = strategyVault.totalAssets();
+
+        emit log("=== Initial Position ===");
         emit log_named_decimal_uint("Initial assets", initialAssets, 18);
+        _logPositions();
 
         // Advance time to accrue real yield on sreUSD
         // sreUSD typically accrues ~18% APY
         skip(30 days);
 
-        emit log("=== After 30 days ==.");
+        emit log("=== After 30 Days ===");
         _logPositions();
 
         // Prevent redeploy to avoid stale oracle reads after time skip.
@@ -182,7 +185,7 @@ contract LoopStrategyForkTest is Test {
         strategyVault.deposit(INITIAL_DEPOSIT, user);
         vm.stopPrank();
 
-        emit log("=== Before Withdrawal ==.");
+        emit log("=== Before Withdrawal ===");
         _logPositions();
 
         // Withdraw 30%
@@ -192,7 +195,7 @@ contract LoopStrategyForkTest is Test {
         vm.prank(user);
         uint256 assetsWithdrawn = strategyVault.redeem(sharesToWithdraw, user, user);
 
-        emit log("=== After Withdrawal ==.");
+        emit log("=== After Withdrawal ===");
         emit log_named_decimal_uint("Assets withdrawn", assetsWithdrawn, 18);
         _logPositions();
 
@@ -212,7 +215,7 @@ contract LoopStrategyForkTest is Test {
         strategyVault.deposit(INITIAL_DEPOSIT, user);
         vm.stopPrank();
 
-        emit log("=== Before Full Withdrawal ==.");
+        emit log("=== Before Full Withdrawal ===");
         _logPositions();
 
         // Withdraw everything
@@ -228,7 +231,7 @@ contract LoopStrategyForkTest is Test {
         vm.prank(user);
         uint256 assetsWithdrawn = strategyVault.redeem(shares, user, user);
 
-        emit log("=== After Full Withdrawal ==.");
+        emit log("=== After Full Withdrawal ===");
         emit log_named_decimal_uint("Assets withdrawn", assetsWithdrawn, 18);
         _logPositions();
 

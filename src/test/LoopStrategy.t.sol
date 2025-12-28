@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.18;
 
-import "forge-std/console.sol";
 import {Setup} from "./utils/Setup.sol";
 
 import {SreUSDCrvUSDLoopStrategy} from "../SreUSDCrvUSDLoopStrategy.sol";
@@ -17,7 +16,7 @@ contract LoopStrategyTest is Setup {
     ERC20Mock public crvUSD;
     MockSreUSD public sreUSD;
     MockCurveLLAMMA public curveLLAMMA;
-    MockResupply public resupply;
+    MockResupply public resupplyPair;
 
     address public swapper = address(100); // Mock swapper for Resupply
     address public curveZap = address(101); // Mock Zap for Curve
@@ -38,7 +37,7 @@ contract LoopStrategyTest is Setup {
 
         // Deploy mock protocols
         curveLLAMMA = new MockCurveLLAMMA(address(sreUSD), address(crvUSD));
-        resupply = new MockResupply(address(crvUSD), address(reUSD), swapper);
+        resupplyPair = new MockResupply(address(crvUSD), address(reUSD), swapper);
 
         // Deploy the loop strategy
         loopStrategy = new SreUSDCrvUSDLoopStrategy(
@@ -46,7 +45,7 @@ contract LoopStrategyTest is Setup {
             address(sreUSD),
             address(crvUSD),
             address(curveLLAMMA),
-            address(resupply),
+            address(resupplyPair),
             "SreUSD Loop Strategy"
         );
 
@@ -71,7 +70,7 @@ contract LoopStrategyTest is Setup {
         vm.label(address(crvUSD), "crvUSD");
         vm.label(address(sreUSD), "sreUSD");
         vm.label(address(curveLLAMMA), "Curve LLAMMA");
-        vm.label(address(resupply), "Resupply");
+        vm.label(address(resupplyPair), "Resupply Pair");
         vm.label(user, "User");
         vm.label(management, "Management");
     }
@@ -87,7 +86,7 @@ contract LoopStrategyTest is Setup {
         strategyVault.deposit(INITIAL_DEPOSIT, user);
         vm.stopPrank();
 
-        console.log("=== After Deposit ===");
+        emit log("=== After Deposit ===");
         _logPositions();
 
         // Strategy should have leveraged position
@@ -95,10 +94,10 @@ contract LoopStrategyTest is Setup {
 
         // Check we have debt on both protocols
         uint256 curveDebt = curveLLAMMA.debt(address(loopStrategy));
-        uint256 resupplyShares = resupply.userBorrowShares(address(loopStrategy));
+        uint256 resupplyShares = resupplyPair.userBorrowShares(address(loopStrategy));
 
-        console.log("Curve debt (crvUSD):", curveDebt);
-        console.log("Resupply borrow shares:", resupplyShares);
+        emit log_named_decimal_uint("Curve debt (crvUSD)", curveDebt, 18);
+        emit log_named_decimal_uint("Resupply borrow shares", resupplyShares, 18);
 
         assertGt(curveDebt, 0, "No crvUSD debt");
         assertGt(resupplyShares, 0, "No reUSD debt");
@@ -108,12 +107,12 @@ contract LoopStrategyTest is Setup {
         uint256 sreUSDCollateral = state[0];
         uint256 curveDebtCheck = state[1];
 
-        console.log("sreUSD collateral:", sreUSDCollateral);
-        console.log("Curve debt:", curveDebtCheck);
+        emit log_named_decimal_uint("sreUSD collateral", sreUSDCollateral, 18);
+        emit log_named_decimal_uint("Curve debt", curveDebtCheck, 18);
 
         // LTV should be close to target (95%)
         uint256 curveLTV = (curveDebtCheck * BASIS_POINTS) / sreUSDCollateral;
-        console.log("Curve LTV:", curveLTV, "basis points");
+        emit log_named_uint("Curve LTV (bps)", curveLTV);
 
         assertGe(curveLTV, 9000, "LTV too low"); // At least 90%
         assertLe(curveLTV, 9600, "LTV too high"); // Max 96%
@@ -126,7 +125,7 @@ contract LoopStrategyTest is Setup {
         strategyVault.deposit(INITIAL_DEPOSIT, user);
         vm.stopPrank();
 
-        console.log("=== Initial Position ===");
+        emit log("=== Initial Position ===");
         _logPositions();
 
         // Call report (this calls _harvestAndReport internally)
@@ -134,7 +133,7 @@ contract LoopStrategyTest is Setup {
         strategyVault.report();
 
         uint256 totalAssets = strategyVault.totalAssets();
-        console.log("Total assets reported:", totalAssets);
+        emit log_named_decimal_uint("Total assets reported", totalAssets, 18);
 
         // Total assets should equal initial deposit (no yield yet)
         // Allow for small rounding errors
@@ -143,14 +142,14 @@ contract LoopStrategyTest is Setup {
         // Now simulate yield accrual on sreUSD
         sreUSD.accrueYield(); // Adds 1% yield
 
-        console.log("\n=== After sreUSD Yield ===");
+        emit log("=== After sreUSD Yield ===");
         _logPositions();
 
         vm.prank(keeper);
         strategyVault.report();
 
         uint256 totalAssetsAfterYield = strategyVault.totalAssets();
-        console.log("Total assets after yield:", totalAssetsAfterYield);
+        emit log_named_decimal_uint("Total assets after yield", totalAssetsAfterYield, 18);
 
         // Should have gained from sreUSD appreciation
         assertGt(totalAssetsAfterYield, totalAssets, "No yield captured");
@@ -159,8 +158,8 @@ contract LoopStrategyTest is Setup {
         uint256[4] memory stateAfter = curveLLAMMA.user_state(address(loopStrategy));
         uint256 sreUSDValue = sreUSD.convertToAssets(stateAfter[0]);
 
-        console.log("sreUSD collateral value:", sreUSDValue);
-        console.log("Profit:", totalAssetsAfterYield - totalAssets);
+        emit log_named_decimal_uint("sreUSD collateral value", sreUSDValue, 18);
+        emit log_named_decimal_uint("Profit", totalAssetsAfterYield - totalAssets, 18);
     }
 
     // NOTE: Partial and full withdrawal tests are in LoopStrategyFork.t.sol
@@ -190,44 +189,44 @@ contract LoopStrategyTest is Setup {
                             HELPER FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    function _logPositions() internal view {
-        console.log("\n--- Strategy Positions ---");
+    function _logPositions() internal {
+        emit log("--- Strategy Positions ---");
 
         // Idle balances
-        console.log("Idle reUSD:", reUSD.balanceOf(address(loopStrategy)));
-        console.log("Idle crvUSD:", crvUSD.balanceOf(address(loopStrategy)));
-        console.log("Idle sreUSD:", sreUSD.balanceOf(address(loopStrategy)));
+        emit log_named_decimal_uint("Idle reUSD", reUSD.balanceOf(address(loopStrategy)), 18);
+        emit log_named_decimal_uint("Idle crvUSD", crvUSD.balanceOf(address(loopStrategy)), 18);
+        emit log_named_decimal_uint("Idle sreUSD", sreUSD.balanceOf(address(loopStrategy)), 18);
 
         // Curve position
         if (curveLLAMMA.loan_exists(address(loopStrategy))) {
             uint256[4] memory curveState = curveLLAMMA.user_state(address(loopStrategy));
-            console.log("\nCurve LLAMMA:");
-            console.log("  sreUSD collateral:", curveState[0]);
-            console.log("  crvUSD debt:", curveState[1]);
+            emit log("Curve LLAMMA:");
+            emit log_named_decimal_uint("  sreUSD collateral", curveState[0], 18);
+            emit log_named_decimal_uint("  crvUSD debt", curveState[1], 18);
             if (curveState[0] > 0) {
                 uint256 ltv = (curveState[1] * BASIS_POINTS) / curveState[0];
-                console.log("  LTV:", ltv, "bps");
+                emit log_named_uint("  LTV (bps)", ltv);
             }
         }
 
         // Resupply position
-        uint256 resupplyCollateral = resupply.userCollateralBalance(address(loopStrategy));
-        uint256 resupplyShares = resupply.userBorrowShares(address(loopStrategy));
-        uint256 resupplyDebt = resupply.toBorrowAmount(resupplyShares, false, false);
+        uint256 resupplyCollateral = resupplyPair.userCollateralBalance(address(loopStrategy));
+        uint256 resupplyShares = resupplyPair.userBorrowShares(address(loopStrategy));
+        uint256 resupplyDebt = resupplyPair.toBorrowAmount(resupplyShares, false, false);
 
-        console.log("\nResupply:");
-        console.log("  crvUSD collateral:", resupplyCollateral);
-        console.log("  reUSD borrow shares:", resupplyShares);
-        console.log("  reUSD debt:", resupplyDebt);
+        emit log("Resupply:");
+        emit log_named_decimal_uint("  crvUSD collateral", resupplyCollateral, 18);
+        emit log_named_decimal_uint("  reUSD borrow shares", resupplyShares, 18);
+        emit log_named_decimal_uint("  reUSD debt", resupplyDebt, 18);
         if (resupplyCollateral > 0 && resupplyDebt > 0) {
             uint256 ltv = (resupplyDebt * BASIS_POINTS) / resupplyCollateral;
-            console.log("  LTV:", ltv, "bps");
+            emit log_named_uint("  LTV (bps)", ltv);
         }
 
         // sreUSD exchange rate
         uint256 rate = sreUSD.exchangeRate();
-        console.log("\nsreUSD exchange rate:", rate);
+        emit log_named_decimal_uint("sreUSD exchange rate", rate, 18);
 
-        console.log("-------------------------\n");
+        emit log("-------------------------");
     }
 }
