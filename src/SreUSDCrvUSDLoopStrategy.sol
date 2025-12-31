@@ -150,11 +150,13 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
     // Target LTV parameters (basis points: 10000 = 100%)
     uint256 public targetResupplyLTV;   // Target: 9200 (92%)
-    uint256 public targetCurveLTV;      // Target: 9500 (95% - safe LTV for LLAMMA)
+    uint256 public targetCurveLTV;      // Target: 9500 (95%)
 
-    // Maximum safe LTVs
-    uint256 public constant MAX_RESUPPLY_LTV = 9500;    // 95% - protocol maximum
-    uint256 public immutable maxCurveLTV;               // Queried from Curve LLAMMA (loan_discount)
+    // Protocol maximum LTVs (used to validate setter inputs)
+    uint256 public constant PROTOCOL_MAX_RESUPPLY_LTV = 9500;  // 95% - Resupply protocol max
+    // 96% max from Curve: LTV = 100% - loan_discount(2%) - N/(2*A)
+    // where N = number of bands, A = amplification parameter
+    uint256 public constant PROTOCOL_MAX_CURVE_LTV = 9600;
     uint256 public constant BASIS_POINTS = 10000;
 
     // Loop parameters
@@ -189,17 +191,13 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         curveLLAMMA = ICurveLLAMMA(_curveLLAMMA);
         resupplyPair = IResupply(_resupplyPair);
 
-        // Query max LTV from Curve LLAMMA: maxLTV = 1 - loan_discount - 2% safety buffer
-        uint256 loanDiscount = curveLLAMMA.loan_discount();
-        maxCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - 200;
-
-        // Set default target LTVs
+        // Set default target LTVs (used for both leverage and deleverage)
+        targetCurveLTV = 9500;     // 95% for Curve LLAMMA
         targetResupplyLTV = 9200;  // 92% for Resupply
-        targetCurveLTV = maxCurveLTV;  // Use max (already has 2% safety buffer)
 
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
-        minLoopAmount = 10e18;       // Min 10 reUSD to continue looping (borrow has try/catch for protocol min)
+        minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
 
         // Approve tokens for protocol interactions
         crvUSD.safeApprove(_resupplyPair, type(uint256).max);    // Approve crvUSD for Resupply collateral
@@ -311,9 +309,9 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 uint256 withdrawableShares = collateralShares;
                 if (borrowShares > 0) {
                     uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
-                    // Need to keep enough collateral for remaining debt (at 95% LTV max)
+                    // Need to keep enough collateral for remaining debt (at targetResupplyLTV)
                     // minCollateral is in underlying crvUSD terms
-                    uint256 minCollateralUnderlying = (debtAmount * BASIS_POINTS) / MAX_RESUPPLY_LTV;
+                    uint256 minCollateralUnderlying = (debtAmount * BASIS_POINTS) / targetResupplyLTV;
                     // Convert collateral shares to underlying to compare
                     address collateralToken = resupplyPair.collateral();
                     uint256 collateralUnderlying = _toCollateralAssets(collateralToken, collateralShares);
@@ -352,12 +350,17 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 if (sreUSDCollateral > 0) {
                     uint256 withdrawable = sreUSDCollateral;
                     if (curveDebt > 0) {
-                        // Keep enough collateral for remaining debt at max LTV
-                        // minCollateral = debt / MAX_LTV (in same units as collateral)
-                        uint256 minCollateralAtMaxLTV = (curveDebt * BASIS_POINTS) / maxCurveLTV;
-                        if (sreUSDCollateral > minCollateralAtMaxLTV) {
-                            // Withdraw 95% of excess to leave small buffer
-                            withdrawable = ((sreUSDCollateral - minCollateralAtMaxLTV) * 95) / 100;
+                        // Convert sreUSD shares to underlying value (reUSD ≈ crvUSD)
+                        uint256 collateralValue = sreUSD.convertToAssets(sreUSDCollateral);
+
+                        // Calculate minimum collateral value needed (at targetCurveLTV)
+                        // minCollateralValue = debt / targetLTV (in reUSD/crvUSD terms)
+                        uint256 minCollateralValue = (curveDebt * BASIS_POINTS) / targetCurveLTV;
+
+                        if (collateralValue > minCollateralValue) {
+                            // Calculate withdrawable value, then convert to shares
+                            uint256 withdrawableValue = collateralValue - minCollateralValue;
+                            withdrawable = sreUSD.convertToShares(withdrawableValue);
                         } else {
                             withdrawable = 0;
                         }
@@ -516,8 +519,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         uint256 _resupplyLTV,
         uint256 _curveLTV
     ) external onlyManagement {
-        require(_resupplyLTV <= MAX_RESUPPLY_LTV, "Resupply LTV too high");
-        require(_curveLTV <= maxCurveLTV, "Curve LTV too high");
+        require(_resupplyLTV <= PROTOCOL_MAX_RESUPPLY_LTV, "Resupply LTV too high");
+        require(_curveLTV <= PROTOCOL_MAX_CURVE_LTV, "Curve LTV too high");
 
         targetResupplyLTV = _resupplyLTV;
         targetCurveLTV = _curveLTV;
