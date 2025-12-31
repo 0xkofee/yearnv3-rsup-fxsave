@@ -77,6 +77,12 @@ interface ICurvePool {
     function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
 }
 
+// Curve Tricrypto Pool Interface (uses uint256 indices)
+interface ICurveTricrypto {
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256);
+}
+
 // Uniswap V3 Router Interface
 interface IUniswapV3Router {
     struct ExactInputParams {
@@ -185,17 +191,21 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
 
     // Reward token handling
-    // DEX types: 0 = Curve, 1 = Uniswap V3
+    // DEX types: 0 = Curve (int128 indices), 1 = Uniswap V3, 2 = Curve tricrypto (uint256 indices)
     struct SwapRoute {
         address router;         // DEX router/pool address
         bytes path;             // Swap path (Curve: encoded i,j indices; UniV3: encoded path)
-        uint8 dexType;          // 0 = Curve, 1 = Uniswap V3
+        uint8 dexType;          // 0 = Curve, 1 = Uniswap V3, 2 = Curve tricrypto
         bool enabled;           // Whether this route is active
     }
 
     address[] public rewardTokens;                      // List of reward tokens to claim
     mapping(address => SwapRoute) public rewardRoutes;  // token => swap route to crvUSD
     uint256 public minSellAmount;                       // Minimum reward amount worth selling
+
+    // Reward swap: crvUSD → scrvUSD → reUSD
+    IERC4626 public scrvUSD;                            // scrvUSD vault (ERC4626 wrapper for crvUSD)
+    ICurvePool public scrvUSDReUSDPool;                 // scrvUSD/reUSD Curve pool for final swap
 
 
     /*//////////////////////////////////////////////////////////////
@@ -232,7 +242,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
         minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
-        minSellAmount = 1e18;        // Min 1 token worth selling (dust threshold)
+        minSellAmount = 5e16;        // Min 0.05 tokens (~$175 for WETH) - allows intermediate token swaps
 
         // Approve tokens for protocol interactions
         crvUSD.safeApprove(_resupplyPair, type(uint256).max);    // Approve crvUSD for Resupply collateral
@@ -434,12 +444,17 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * - These roughly net to zero, so only sreUSD collateral and reUSD debt matter
      */
     function _harvestAndReport() internal override returns (uint256) {
-        // 0. Claim and sell rewards for crvUSD, then deposit to Resupply for reUSD
+        // 0. Claim and sell rewards for crvUSD, then swap to reUSD
         uint256 crvUSDFromRewards = _claimAndSellRewards();
-        if (crvUSDFromRewards > minLoopAmount) {
-            // Deposit crvUSD to Resupply and borrow reUSD at target LTV
-            uint256 reUSDBorrowAmount = (crvUSDFromRewards * targetResupplyLTV) / BASIS_POINTS;
-            try resupplyPair.borrow(reUSDBorrowAmount, crvUSDFromRewards, address(this)) {} catch {}
+        if (crvUSDFromRewards > minLoopAmount && address(scrvUSDReUSDPool) != address(0)) {
+            // Swap crvUSD → scrvUSD → reUSD
+            // Step 1: Deposit crvUSD to scrvUSD vault
+            uint256 scrvUSDShares = scrvUSD.deposit(crvUSDFromRewards, address(this));
+
+            // Step 2: Swap scrvUSD → reUSD via Curve pool (index 1 → 0)
+            if (scrvUSDShares > 0) {
+                try scrvUSDReUSDPool.exchange(1, 0, scrvUSDShares, 0) {} catch {}
+            }
         }
 
         // 1. Idle reUSD in strategy
@@ -557,10 +572,13 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * @return crvUSDReceived Amount of crvUSD received from selling rewards
      */
     function _claimAndSellRewards() internal returns (uint256 crvUSDReceived) {
+        // Measure crvUSD balance before selling (handles intermediate tokens like WETH)
+        uint256 crvUSDBefore = crvUSD.balanceOf(address(this));
+
         // Claim all pending rewards from Resupply
         try resupplyPair.getReward(address(this)) {} catch {}
 
-        // Sell each reward token for crvUSD
+        // Sell each reward token for crvUSD (or intermediate token)
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
             SwapRoute memory route = rewardRoutes[token];
@@ -570,11 +588,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             uint256 balance = ERC20(token).balanceOf(address(this));
             if (balance < minSellAmount) continue;
 
-            uint256 received = _swap(token, balance, route);
-            crvUSDReceived += received;
+            _swap(token, balance, route);
         }
 
-        return crvUSDReceived;
+        // Return actual crvUSD gained (works correctly with intermediate tokens)
+        return crvUSD.balanceOf(address(this)) - crvUSDBefore;
     }
 
     /**
@@ -590,10 +608,15 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         SwapRoute memory _route
     ) internal returns (uint256 amountOut) {
         if (_route.dexType == 0) {
-            // Curve swap
+            // Curve swap (legacy pools with int128 indices)
             // path is encoded as (int128 i, int128 j)
             (int128 i, int128 j) = abi.decode(_route.path, (int128, int128));
             amountOut = ICurvePool(_route.router).exchange(i, j, _amount, 0);
+        } else if (_route.dexType == 2) {
+            // Curve tricrypto swap (newer pools with uint256 indices)
+            // path is encoded as (uint256 i, uint256 j)
+            (uint256 i, uint256 j) = abi.decode(_route.path, (uint256, uint256));
+            amountOut = ICurveTricrypto(_route.router).exchange(i, j, _amount, 0);
         } else if (_route.dexType == 1) {
             // Uniswap V3 swap
             // path is the encoded swap path (token0, fee, token1, fee, token2, ...)
@@ -731,6 +754,22 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      */
     function setMinSellAmount(uint256 _minSellAmount) external onlyManagement {
         minSellAmount = _minSellAmount;
+    }
+
+    /**
+     * @notice Set the scrvUSD/reUSD pool for swapping reward crvUSD to reUSD
+     * @param _scrvUSD Address of scrvUSD vault (ERC4626 wrapper for crvUSD)
+     * @param _pool Address of scrvUSD/reUSD Curve pool
+     * @dev Pool must have reUSD at index 0 and scrvUSD at index 1
+     */
+    function setRewardSwapPool(address _scrvUSD, address _pool) external onlyManagement {
+        scrvUSD = IERC4626(_scrvUSD);
+        scrvUSDReUSDPool = ICurvePool(_pool);
+
+        // Approve scrvUSD for the pool
+        ERC20(_scrvUSD).safeApprove(_pool, type(uint256).max);
+        // Approve crvUSD for scrvUSD vault
+        crvUSD.safeApprove(_scrvUSD, type(uint256).max);
     }
 
     /**
