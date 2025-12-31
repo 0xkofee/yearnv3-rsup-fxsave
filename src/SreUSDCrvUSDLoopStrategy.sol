@@ -66,6 +66,27 @@ interface IResupply {
 
     // Convert borrow shares to actual debt amount
     function toBorrowAmount(uint256 _shares, bool _roundUp, bool _previewInterest) external view returns (uint256);
+
+    // Claim reward tokens (CRV, CVX, RSUP)
+    function getReward(address _account) external;
+}
+
+// Curve Pool Interface for swapping
+interface ICurvePool {
+    function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
+}
+
+// Uniswap V3 Router Interface
+interface IUniswapV3Router {
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
 // sreUSD Token Interface (ERC-4626 yield-bearing wrapper for reUSD)
@@ -163,6 +184,19 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
     uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
 
+    // Reward token handling
+    // DEX types: 0 = Curve, 1 = Uniswap V3
+    struct SwapRoute {
+        address router;         // DEX router/pool address
+        bytes path;             // Swap path (Curve: encoded i,j indices; UniV3: encoded path)
+        uint8 dexType;          // 0 = Curve, 1 = Uniswap V3
+        bool enabled;           // Whether this route is active
+    }
+
+    address[] public rewardTokens;                      // List of reward tokens to claim
+    mapping(address => SwapRoute) public rewardRoutes;  // token => swap route to crvUSD
+    uint256 public minSellAmount;                       // Minimum reward amount worth selling
+
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -198,6 +232,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
         minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
+        minSellAmount = 1e18;        // Min 1 token worth selling (dust threshold)
 
         // Approve tokens for protocol interactions
         crvUSD.safeApprove(_resupplyPair, type(uint256).max);    // Approve crvUSD for Resupply collateral
@@ -300,33 +335,32 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
             // Step 2: Withdraw crvUSD collateral from Resupply
             // Note: userCollateralBalance returns cvcrvUSD vault shares, not underlying crvUSD
-            uint256 collateralShares = resupplyPair.userCollateralBalance(address(this));
+            uint256 crvUSDCollateralShares = resupplyPair.userCollateralBalance(address(this));
             borrowShares = resupplyPair.userBorrowShares(address(this));
 
-            if (collateralShares > 0) {
+            if (crvUSDCollateralShares > 0) {
                 // If debt remains, can only withdraw excess collateral (maintain solvency)
                 // If no debt, withdraw everything
-                uint256 withdrawableShares = collateralShares;
+                uint256 withdrawableCrvUSDShares = crvUSDCollateralShares;
                 if (borrowShares > 0) {
                     uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
                     // Need to keep enough collateral for remaining debt (at targetResupplyLTV)
-                    // minCollateral is in underlying crvUSD terms
-                    uint256 minCollateralUnderlying = (debtAmount * BASIS_POINTS) / targetResupplyLTV;
+                    uint256 minCrvUSDCollateralValue = (debtAmount * BASIS_POINTS) / targetResupplyLTV;
                     // Convert collateral shares to underlying to compare
                     address collateralToken = resupplyPair.collateral();
-                    uint256 collateralUnderlying = _toCollateralAssets(collateralToken, collateralShares);
+                    uint256 crvUSDCollateralValue = _toCollateralAssets(collateralToken, crvUSDCollateralShares);
 
-                    if (collateralUnderlying > minCollateralUnderlying) {
+                    if (crvUSDCollateralValue > minCrvUSDCollateralValue) {
                         // Calculate withdrawable in underlying terms, then convert back to shares
-                        uint256 withdrawableUnderlying = collateralUnderlying - minCollateralUnderlying;
-                        withdrawableShares = _toCollateralShares(collateralToken, withdrawableUnderlying);
+                        uint256 withdrawableCrvUSDValue = crvUSDCollateralValue - minCrvUSDCollateralValue;
+                        withdrawableCrvUSDShares = _toCollateralShares(collateralToken, withdrawableCrvUSDValue);
                     } else {
-                        withdrawableShares = 0;
+                        withdrawableCrvUSDShares = 0;
                     }
                 }
 
-                if (withdrawableShares > minLoopAmount) {
-                    try resupplyPair.removeCollateral(withdrawableShares, address(this)) {} catch {}
+                if (withdrawableCrvUSDShares > minLoopAmount) {
+                    try resupplyPair.removeCollateral(withdrawableCrvUSDShares, address(this)) {} catch {}
                 }
             }
 
@@ -348,26 +382,26 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 curveDebt = curveLLAMMA.debt(address(this));
 
                 if (sreUSDCollateral > 0) {
-                    uint256 withdrawable = sreUSDCollateral;
+                    uint256 withdrawableSreUSDShares = sreUSDCollateral;
                     if (curveDebt > 0) {
                         // Convert sreUSD shares to underlying value (reUSD ≈ crvUSD)
-                        uint256 collateralValue = sreUSD.convertToAssets(sreUSDCollateral);
+                        uint256 sreUSDCollateralValue = sreUSD.convertToAssets(sreUSDCollateral);
 
                         // Calculate minimum collateral value needed (at targetCurveLTV)
                         // minCollateralValue = debt / targetLTV (in reUSD/crvUSD terms)
-                        uint256 minCollateralValue = (curveDebt * BASIS_POINTS) / targetCurveLTV;
+                        uint256 minSreUSDCollateralValue = (curveDebt * BASIS_POINTS) / targetCurveLTV;
 
-                        if (collateralValue > minCollateralValue) {
+                        if (sreUSDCollateralValue > minSreUSDCollateralValue) {
                             // Calculate withdrawable value, then convert to shares
-                            uint256 withdrawableValue = collateralValue - minCollateralValue;
-                            withdrawable = sreUSD.convertToShares(withdrawableValue);
+                            uint256 withdrawableSreUSDValue = sreUSDCollateralValue - minSreUSDCollateralValue;
+                            withdrawableSreUSDShares = sreUSD.convertToShares(withdrawableSreUSDValue);
                         } else {
-                            withdrawable = 0;
+                            withdrawableSreUSDShares = 0;
                         }
                     }
 
-                    if (withdrawable > minLoopAmount) {
-                        try curveLLAMMA.remove_collateral(withdrawable) {} catch {}
+                    if (withdrawableSreUSDShares > minLoopAmount) {
+                        try curveLLAMMA.remove_collateral(withdrawableSreUSDShares) {} catch {}
                     }
                 }
             }
@@ -400,6 +434,14 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * - These roughly net to zero, so only sreUSD collateral and reUSD debt matter
      */
     function _harvestAndReport() internal override returns (uint256) {
+        // 0. Claim and sell rewards for crvUSD, then deposit to Resupply for reUSD
+        uint256 crvUSDFromRewards = _claimAndSellRewards();
+        if (crvUSDFromRewards > minLoopAmount) {
+            // Deposit crvUSD to Resupply and borrow reUSD at target LTV
+            uint256 reUSDBorrowAmount = (crvUSDFromRewards * targetResupplyLTV) / BASIS_POINTS;
+            try resupplyPair.borrow(reUSDBorrowAmount, crvUSDFromRewards, address(this)) {} catch {}
+        }
+
         // 1. Idle reUSD in strategy
         uint256 idle = reUSD.balanceOf(address(this));
 
@@ -507,6 +549,68 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        REWARD HANDLING
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Claim rewards from Resupply and sell for crvUSD
+     * @return crvUSDReceived Amount of crvUSD received from selling rewards
+     */
+    function _claimAndSellRewards() internal returns (uint256 crvUSDReceived) {
+        // Claim all pending rewards from Resupply
+        try resupplyPair.getReward(address(this)) {} catch {}
+
+        // Sell each reward token for crvUSD
+        for (uint256 i = 0; i < rewardTokens.length; i++) {
+            address token = rewardTokens[i];
+            SwapRoute memory route = rewardRoutes[token];
+
+            if (!route.enabled) continue;
+
+            uint256 balance = ERC20(token).balanceOf(address(this));
+            if (balance < minSellAmount) continue;
+
+            uint256 received = _swap(token, balance, route);
+            crvUSDReceived += received;
+        }
+
+        return crvUSDReceived;
+    }
+
+    /**
+     * @notice Swap reward token to crvUSD using configured route
+     * @param _token Token to swap
+     * @param _amount Amount to swap
+     * @param _route Swap route configuration
+     * @return amountOut Amount of crvUSD received
+     */
+    function _swap(
+        address _token,
+        uint256 _amount,
+        SwapRoute memory _route
+    ) internal returns (uint256 amountOut) {
+        if (_route.dexType == 0) {
+            // Curve swap
+            // path is encoded as (int128 i, int128 j)
+            (int128 i, int128 j) = abi.decode(_route.path, (int128, int128));
+            amountOut = ICurvePool(_route.router).exchange(i, j, _amount, 0);
+        } else if (_route.dexType == 1) {
+            // Uniswap V3 swap
+            // path is the encoded swap path (token0, fee, token1, fee, token2, ...)
+            IUniswapV3Router.ExactInputParams memory params = IUniswapV3Router.ExactInputParams({
+                path: _route.path,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: _amount,
+                amountOutMinimum: 0
+            });
+            amountOut = IUniswapV3Router(_route.router).exactInput(params);
+        }
+
+        return amountOut;
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         MANAGEMENT FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
@@ -540,6 +644,101 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         maxIterations = _maxIterations;
         minLoopAmount = _minLoopAmount;
+    }
+
+    /**
+     * @notice Add a reward token with its swap route
+     * @param _token Address of the reward token
+     * @param _router DEX router/pool address
+     * @param _path Encoded swap path
+     * @param _dexType 0 = Curve, 1 = Uniswap V3
+     */
+    function addRewardToken(
+        address _token,
+        address _router,
+        bytes calldata _path,
+        uint8 _dexType
+    ) external onlyManagement {
+        require(_token != address(0), "Invalid token");
+        require(_router != address(0), "Invalid router");
+
+        // Add to reward tokens list if not already present
+        bool exists = false;
+        for (uint256 i = 0; i < rewardTokens.length; i++) {
+            if (rewardTokens[i] == _token) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            rewardTokens.push(_token);
+        }
+
+        // Set the swap route
+        rewardRoutes[_token] = SwapRoute({
+            router: _router,
+            path: _path,
+            dexType: _dexType,
+            enabled: true
+        });
+
+        // Approve token for router
+        ERC20(_token).safeApprove(_router, type(uint256).max);
+    }
+
+    /**
+     * @notice Update swap route for an existing reward token
+     * @param _token Address of the reward token
+     * @param _router DEX router/pool address
+     * @param _path Encoded swap path
+     * @param _dexType 0 = Curve, 1 = Uniswap V3
+     */
+    function updateRewardRoute(
+        address _token,
+        address _router,
+        bytes calldata _path,
+        uint8 _dexType
+    ) external onlyManagement {
+        require(rewardRoutes[_token].router != address(0), "Token not added");
+
+        // Revoke old approval if router changed
+        if (rewardRoutes[_token].router != _router) {
+            ERC20(_token).safeApprove(rewardRoutes[_token].router, 0);
+            ERC20(_token).safeApprove(_router, type(uint256).max);
+        }
+
+        rewardRoutes[_token] = SwapRoute({
+            router: _router,
+            path: _path,
+            dexType: _dexType,
+            enabled: true
+        });
+    }
+
+    /**
+     * @notice Enable or disable a reward token
+     * @param _token Address of the reward token
+     * @param _enabled Whether to enable or disable
+     */
+    function setRewardTokenEnabled(address _token, bool _enabled) external onlyManagement {
+        require(rewardRoutes[_token].router != address(0), "Token not added");
+        rewardRoutes[_token].enabled = _enabled;
+    }
+
+    /**
+     * @notice Update minimum sell amount for rewards
+     * @param _minSellAmount New minimum amount
+     */
+    function setMinSellAmount(uint256 _minSellAmount) external onlyManagement {
+        minSellAmount = _minSellAmount;
+    }
+
+    /**
+     * @notice Get list of reward tokens
+     * @return Array of reward token addresses
+     */
+    function getRewardTokens() external view returns (address[] memory) {
+        return rewardTokens;
     }
 
     /**
