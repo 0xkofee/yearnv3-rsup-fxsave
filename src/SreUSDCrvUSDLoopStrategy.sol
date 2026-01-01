@@ -194,7 +194,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
-    uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
+    uint256 public minLoopAmount;       // Minimum amount to continue looping (leverage dust threshold)
+    uint256 public minBufferAmount;     // Minimum idle buffer to maintain for withdrawals
     uint256 public idleBufferBps;       // Percentage of idle reUSD to keep as buffer (basis points)
 
     // Reward token handling
@@ -249,6 +250,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
         minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
+        minBufferAmount = 1000e18;   // Min 1000 reUSD idle buffer for withdrawals
         idleBufferBps = 1000;        // 10% of idle reUSD kept as buffer for withdrawals
         minSellAmount = 5e16;        // Min 0.05 tokens (~$175 for WETH) - allows intermediate token swaps
 
@@ -370,8 +372,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         uint256 targetBuffer = 0;
         if (!isFullWithdrawal) {
             targetBuffer = (remainingAfter * idleBufferBps) / BASIS_POINTS;
-            if (targetBuffer < minLoopAmount) {
-                targetBuffer = minLoopAmount;
+            if (targetBuffer < minBufferAmount) {
+                targetBuffer = minBufferAmount;
             }
         }
 
@@ -783,20 +785,24 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     /**
      * @notice Update loop parameters
      * @param _maxIterations New maximum iterations
-     * @param _minLoopAmount New minimum loop amount
+     * @param _minLoopAmount New minimum loop amount (for leverage operations)
+     * @param _minBufferAmount Minimum idle buffer to maintain for withdrawals
      * @param _idleBufferBps Percentage of idle reUSD to keep as buffer (basis points, e.g., 500 = 5%)
      */
     function setLoopParameters(
         uint256 _maxIterations,
         uint256 _minLoopAmount,
+        uint256 _minBufferAmount,
         uint256 _idleBufferBps
     ) external onlyManagement {
         require(_maxIterations > 0 && _maxIterations <= 50, "Invalid max iterations");
         require(_minLoopAmount > 0, "Invalid min loop amount");
+        require(_minBufferAmount > 0, "Invalid min buffer amount");
         require(_idleBufferBps <= 2000, "Buffer too high"); // Max 20%
 
         maxIterations = _maxIterations;
         minLoopAmount = _minLoopAmount;
+        minBufferAmount = _minBufferAmount;
         idleBufferBps = _idleBufferBps;
     }
 

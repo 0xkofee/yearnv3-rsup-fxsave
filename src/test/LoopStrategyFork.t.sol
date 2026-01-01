@@ -164,7 +164,7 @@ contract LoopStrategyForkTest is Test {
         skip(30 days);
 
         vm.prank(management);
-        loopStrategy.setLoopParameters(loopStrategy.maxIterations(), type(uint256).max, loopStrategy.idleBufferBps());
+        loopStrategy.setLoopParameters(loopStrategy.maxIterations(), type(uint256).max, loopStrategy.minBufferAmount(), loopStrategy.idleBufferBps());
 
         vm.prank(keeper);
         strategyVault.report();
