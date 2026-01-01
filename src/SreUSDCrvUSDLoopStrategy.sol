@@ -186,6 +186,12 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     uint256 public constant PROTOCOL_MAX_CURVE_LTV = 9600;
     uint256 public constant BASIS_POINTS = 10000;
 
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event FullWithdrawal(uint256 amount, uint256 vaultTotalAssets);
+
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
     uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
@@ -343,15 +349,22 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         // Calculate buffer based on remaining assets after this withdrawal
         uint256 currentIdle = reUSD.balanceOf(address(this));
-        uint256 totalAssets = _calculateTotalAssets(currentIdle);
+        uint256 freshTotalAssets = _calculateTotalAssets(currentIdle);
 
         // User will receive: currentIdle + _amount
-        // Remaining after withdrawal: totalAssets - userReceives
+        // Remaining after withdrawal: freshTotalAssets - userReceives
         uint256 userReceives = currentIdle + _amount;
-        uint256 remainingAfter = totalAssets > userReceives ? totalAssets - userReceives : 0;
+        uint256 remainingAfter = freshTotalAssets > userReceives ? freshTotalAssets - userReceives : 0;
 
-        // If no assets remain after this withdrawal, close everything (no buffer needed)
-        bool isFullWithdrawal = (remainingAfter == 0);
+        // If user is withdrawing everything the vault tracks, close all positions
+        // Using vault's totalAssets() avoids mismatch from yield accrual or profit locking
+        // Note: _amount is only what needs to be freed; userReceives = idle + _amount = total withdrawn
+        uint256 vaultTotalAssets = TokenizedStrategy.totalAssets();
+        bool isFullWithdrawal = (userReceives >= vaultTotalAssets);
+
+        if (isFullWithdrawal) {
+            emit FullWithdrawal(userReceives, vaultTotalAssets);
+        }
 
         // Buffer = X% of remaining assets (ensures future withdrawals can deleverage)
         uint256 targetBuffer = 0;

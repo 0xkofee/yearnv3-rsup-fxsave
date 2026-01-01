@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.18;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 
 import {SreUSDCrvUSDLoopStrategy} from "../SreUSDCrvUSDLoopStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
@@ -18,6 +18,12 @@ interface IResupply {
     function collateral() external view returns (address);
 }
 
+interface ICurveLLAMMA {
+    function loan_exists(address user) external view returns (bool);
+    function debt(address user) external view returns (uint256);
+}
+
+
 interface IStrategyWithRedeem {
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
 }
@@ -33,6 +39,9 @@ interface IStrategyWithRedeem {
 contract LoopStrategyForkTest is Test {
     SreUSDCrvUSDLoopStrategy public loopStrategy;
     IStrategy public strategyVault;
+
+    // Events (must match strategy events for vm.expectEmit)
+    event FullWithdrawal(uint256 amount, uint256 vaultTotalAssets);
 
     // Real mainnet addresses
     address public constant REUSD = 0x57aB1E0003F623289CD798B1824Be09a793e4Bec;
@@ -107,6 +116,31 @@ contract LoopStrategyForkTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                            HELPER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Check if FullWithdrawal event was emitted in recorded logs
+    function assertFullWithdrawalEmitted(Vm.Log[] memory logs) internal pure {
+        bytes32 fullWithdrawalSelector = keccak256("FullWithdrawal(uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == fullWithdrawalSelector) {
+                return; // Found the event
+            }
+        }
+        revert("FullWithdrawal event was not emitted");
+    }
+
+    /// @notice Check that FullWithdrawal event was NOT emitted in recorded logs
+    function assertFullWithdrawalNotEmitted(Vm.Log[] memory logs) internal pure {
+        bytes32 fullWithdrawalSelector = keccak256("FullWithdrawal(uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == fullWithdrawalSelector) {
+                revert("FullWithdrawal event should not have been emitted");
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         STRATEGY LIFECYCLE TESTS
     //////////////////////////////////////////////////////////////*/
 
@@ -164,12 +198,25 @@ contract LoopStrategyForkTest is Test {
         uint256 shares = strategyVault.balanceOf(user);
         uint256 expectedAssets = strategyVault.previewRedeem(shares);
 
+        // Verify positions exist before withdrawal
+        assertTrue(ICurveLLAMMA(CURVE_LLAMMA).loan_exists(address(loopStrategy)), "Curve loan should exist before");
+        assertGt(IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy)), 0, "Resupply debt should exist before");
+
+        vm.recordLogs();
+
         vm.prank(user);
         uint256 assetsWithdrawn = strategyVault.redeem(shares, user, user);
+
+        // Verify FullWithdrawal event was emitted
+        assertFullWithdrawalEmitted(vm.getRecordedLogs());
 
         assertGt(assetsWithdrawn, 0, "No assets withdrawn");
         assertLe(assetsWithdrawn, expectedAssets, "Withdrawal exceeds preview");
         assertEq(strategyVault.balanceOf(user), 0, "Shares not fully burned");
+
+        // Verify isFullWithdrawal triggered: positions should be closed
+        assertEq(ICurveLLAMMA(CURVE_LLAMMA).debt(address(loopStrategy)), 0, "Curve debt should be 0 after full withdrawal");
+        assertEq(IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy)), 0, "Resupply debt should be 0 after full withdrawal");
     }
 
     function testFork_MultiUserWithdrawal() public {
@@ -198,26 +245,36 @@ contract LoopStrategyForkTest is Test {
 
         assertGt(IERC20(REUSD).balanceOf(address(loopStrategy)), 0, "Should have idle buffer");
 
-        // User1 withdraws
+        // User1 withdraws (partial - should NOT emit FullWithdrawal)
+        vm.recordLogs();
         vm.prank(user1);
         uint256 assets1 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares1, user1, user1);
+        assertFullWithdrawalNotEmitted(vm.getRecordedLogs());
         assertGt(assets1, 9500e18, "User1 should receive most of deposit");
         assertEq(IERC20(address(loopStrategy)).balanceOf(user1), 0, "User1 should have no shares");
 
-        // User2 withdraws
+        // User2 withdraws (partial - should NOT emit FullWithdrawal)
+        vm.recordLogs();
         vm.prank(user2);
         uint256 assets2 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares2, user2, user2);
+        assertFullWithdrawalNotEmitted(vm.getRecordedLogs());
         assertGt(assets2, 4750e18, "User2 should receive most of deposit");
         assertEq(IERC20(address(loopStrategy)).balanceOf(user2), 0, "User2 should have no shares");
 
-        // User3 withdraws
+        // User3 withdraws (last user - SHOULD emit FullWithdrawal)
+        vm.recordLogs();
         vm.prank(user3);
         uint256 assets3 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares3, user3, user3);
+        assertFullWithdrawalEmitted(vm.getRecordedLogs());
         assertGt(assets3, 2850e18, "User3 should receive most of deposit");
         assertEq(IERC20(address(loopStrategy)).balanceOf(user3), 0, "User3 should have no shares");
 
         // Strategy should be empty
         assertEq(strategyVault.totalAssets(), 0, "Strategy should be empty");
+
+        // Verify positions are fully closed
+        assertEq(ICurveLLAMMA(CURVE_LLAMMA).debt(address(loopStrategy)), 0, "Curve debt should be 0");
+        assertEq(IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy)), 0, "Resupply debt should be 0");
     }
 
     /*//////////////////////////////////////////////////////////////
