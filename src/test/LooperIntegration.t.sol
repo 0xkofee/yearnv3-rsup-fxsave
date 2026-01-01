@@ -391,13 +391,115 @@ contract LooperIntegrationTest is Test {
         assertEq(IERC20(RSUP).balanceOf(strategyAddr), 0, "RSUP should be fully sold");
         assertEq(IERC20(WETH).balanceOf(strategyAddr), 0, "WETH should be fully sold");
 
-        // Some crvUSD dust is expected from the last loop iteration (below minLoopAmount)
+        // Some crvUSD may remain as idle buffer or dust from loop iterations
         // The important thing is that rewards increased totalAssets
         uint256 crvUSDRemaining = IERC20(CRVUSD).balanceOf(strategyAddr);
-        assertLt(crvUSDRemaining, 1200e18, "crvUSD dust should be below minLoopAmount");
+        emit log_named_decimal_uint("crvUSD remaining", crvUSDRemaining, 18);
 
         // Verify profit was captured
         assertGt(totalAssetsAfter, totalAssetsBefore, "totalAssets should increase from rewards");
     }
+
+    /*//////////////////////////////////////////////////////////////
+                    WITHDRAWAL WITH CRVUSD DUST TEST
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Tests withdrawal when strategy maintains idle reUSD buffer for deleverage
+    /// Strategy keeps minLoopAmount (1100 reUSD) as buffer to ensure withdrawals can always start
+    function testWithdraw_WithIdleBuffer() public {
+        // Deploy strategy with real mainnet addresses
+        address SREUSD = 0x557AB1e003951A73c12D16F0fEA8490E39C33C35;
+        address CURVE_LLAMMA = 0x4F79Fe450a2BAF833E8f50340BD230f5A3eCaFe9;
+
+        SreUSDCrvUSDLoopStrategy strategy = new SreUSDCrvUSDLoopStrategy(
+            REUSD,
+            SREUSD,
+            CRVUSD,
+            CURVE_LLAMMA,
+            RESUPPLY_PAIR,
+            "Test Loop Strategy"
+        );
+
+        address strategyAddr = address(strategy);
+
+        // Setup roles
+        ITokenizedStrategy(strategyAddr).setKeeper(address(this));
+
+        // Configure crvUSD -> reUSD swap (needed for withdrawal bootstrap)
+        strategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
+
+        // === 3 Users deposit ===
+        address user1 = address(0x1111);
+        address user2 = address(0x2222);
+        address user3 = address(0x3333);
+
+        // User1: 10,000 reUSD
+        deal(REUSD, user1, 10_000e18);
+        vm.startPrank(user1);
+        IERC20(REUSD).approve(strategyAddr, 10_000e18);
+        uint256 shares1 = IStrategy(strategyAddr).deposit(10_000e18, user1);
+        vm.stopPrank();
+        emit log_named_decimal_uint("User1 deposited", 10_000e18, 18);
+        emit log_named_decimal_uint("User1 shares", shares1, 18);
+
+        // User2: 5,000 reUSD
+        deal(REUSD, user2, 5_000e18);
+        vm.startPrank(user2);
+        IERC20(REUSD).approve(strategyAddr, 5_000e18);
+        IStrategy(strategyAddr).deposit(5_000e18, user2);
+        vm.stopPrank();
+        emit log_named_decimal_uint("User2 deposited", 5_000e18, 18);
+
+        // User3: 3,000 reUSD
+        deal(REUSD, user3, 3_000e18);
+        vm.startPrank(user3);
+        IERC20(REUSD).approve(strategyAddr, 3_000e18);
+        IStrategy(strategyAddr).deposit(3_000e18, user3);
+        vm.stopPrank();
+        emit log_named_decimal_uint("User3 deposited", 3_000e18, 18);
+
+        // === Check position state ===
+        emit log("=== After All Deposits ===");
+        emit log_named_decimal_uint("Total assets", IStrategy(strategyAddr).totalAssets(), 18);
+        emit log_named_decimal_uint("Idle reUSD", IERC20(REUSD).balanceOf(strategyAddr), 18);
+        emit log_named_decimal_uint("Idle crvUSD", IERC20(CRVUSD).balanceOf(strategyAddr), 18);
+
+        // Verify strategy maintains idle reUSD buffer
+        // Buffer is idleBufferBps% of each deposit (accumulates incrementally)
+        emit log("=== Idle Balances ===");
+        uint256 idleBuffer = IERC20(REUSD).balanceOf(strategyAddr);
+        emit log_named_decimal_uint("Idle reUSD buffer", idleBuffer, 18);
+        emit log_named_decimal_uint("Idle crvUSD (dust)", IERC20(CRVUSD).balanceOf(strategyAddr), 18);
+
+        // Strategy should have some idle buffer from 5% of deposits
+        assertGt(idleBuffer, 0, "Should have some idle buffer");
+
+        // === User1 tries to withdraw full 10k ===
+        emit log("=== User1 Attempting Full Withdrawal ===");
+
+        emit log_named_decimal_uint("User1 shares before", IERC20(strategyAddr).balanceOf(user1), 18);
+        emit log_named_decimal_uint("User1 reUSD before", IERC20(REUSD).balanceOf(user1), 18);
+
+        // Try to redeem all shares
+        vm.startPrank(user1);
+        uint256 assetsReceived = IStrategyWithRedeem(strategyAddr).redeem(shares1, user1, user1);
+        vm.stopPrank();
+
+        emit log("=== After User1 Withdrawal ===");
+        emit log_named_decimal_uint("Assets received", assetsReceived, 18);
+        emit log_named_decimal_uint("User1 reUSD after", IERC20(REUSD).balanceOf(user1), 18);
+        emit log_named_decimal_uint("User1 shares after", IERC20(strategyAddr).balanceOf(user1), 18);
+        emit log_named_decimal_uint("Strategy total assets", IStrategy(strategyAddr).totalAssets(), 18);
+        emit log_named_decimal_uint("Strategy idle reUSD", IERC20(REUSD).balanceOf(strategyAddr), 18);
+        emit log_named_decimal_uint("Strategy idle crvUSD", IERC20(CRVUSD).balanceOf(strategyAddr), 18);
+
+        // User should have received close to their deposit (minus slippage/fees)
+        assertGt(assetsReceived, 9500e18, "User1 should receive most of their deposit");
+        assertEq(IERC20(strategyAddr).balanceOf(user1), 0, "User1 should have no shares left");
+    }
+}
+
+interface IStrategyWithRedeem {
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
 }
 

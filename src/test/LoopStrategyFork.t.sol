@@ -41,6 +41,10 @@ contract LoopStrategyForkTest is Test {
     // reUSD holder for testing
     address public constant reUSDHolder = 0x47628677D8Aa6f5E11e37779576852e0209D6aE7;
 
+    // Swap pool for crvUSD -> reUSD bootstrap during deleverage
+    address public constant SCRVUSD = 0x0655977FEb2f289A4aB78af67BAB0d17aAb84367;
+    address public constant SCRVUSD_REUSD_POOL = 0xc522A6606BBA746d7960404F22a3DB936B6F4F50;
+
     uint256 public constant INITIAL_DEPOSIT = 10000 ether; // Take note rsup minimum borrow threshold
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public mainnetFork;
@@ -90,6 +94,9 @@ contract LoopStrategyForkTest is Test {
 
         vm.prank(management);
         strategyVault.acceptManagement();
+
+        // Configure crvUSD -> reUSD swap pool for deleverage bootstrap
+        loopStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
 
         // Fund user with reUSD; prefer cheatcode to avoid holder balance drift across forks
         deal(REUSD, user, 20000 ether, true);
@@ -160,7 +167,7 @@ contract LoopStrategyForkTest is Test {
 
         // Prevent redeploy to avoid stale oracle reads after time skip.
         vm.prank(management);
-        loopStrategy.setLoopParameters(loopStrategy.maxIterations(), type(uint256).max);
+        loopStrategy.setLoopParameters(loopStrategy.maxIterations(), type(uint256).max, loopStrategy.idleBufferBps());
 
         // Report to update accounting with real yield
         vm.prank(keeper);

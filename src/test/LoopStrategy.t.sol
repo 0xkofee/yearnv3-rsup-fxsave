@@ -169,6 +169,7 @@ contract LoopStrategyTest is Setup {
 
     // NOTE: Yield profit and multi-user tests are in LoopStrategyFork.t.sol
     // Mock-based tests don't accurately simulate real protocol behavior.
+    // Harvest/reward swap tests are in LooperIntegration.t.sol using real Curve pools.
 
     /*//////////////////////////////////////////////////////////////
                         EDGE CASE TESTS

@@ -351,4 +351,10 @@ contract MockResupply {
 
         return amount;
     }
+
+    // Mock reward claiming - in real Resupply this distributes CRV, CVX, RSUP
+    // For testing, this is a no-op. Tests should mint reward tokens directly to strategy.
+    function getReward(address _account) external {
+        // No-op in mock - rewards are simulated by minting tokens directly
+    }
 }

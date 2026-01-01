@@ -189,6 +189,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
     uint256 public minLoopAmount;       // Minimum amount to continue looping (dust threshold)
+    uint256 public idleBufferBps;       // Percentage of idle reUSD to keep as buffer (basis points)
 
     // Reward token handling
     // DEX types: 0 = Curve (int128 indices), 1 = Uniswap V3, 2 = Curve tricrypto (uint256 indices)
@@ -242,6 +243,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
         minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
+        idleBufferBps = 1000;        // 10% of idle reUSD kept as buffer for withdrawals
         minSellAmount = 5e16;        // Min 0.05 tokens (~$175 for WETH) - allows intermediate token swaps
 
         // Approve tokens for protocol interactions
@@ -265,11 +267,29 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * @param _amount Amount of reUSD to deploy
      * @dev Loops to build leverage position, starting with deposited reUSD
      *      Creates buy pressure on reUSD which helps the peg
+     *      Keeps idleBufferBps% of deposit as idle buffer
      */
     function _deployFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
-        uint256 reUSDToLoop = _amount;
+        // Keep idleBufferBps% of current idle as buffer for deleverage operations
+        // This ensures we always have reUSD to start unwinding positions
+        // Note: We use currentIdle (not totalAssets) because totalAssets is stale until report()
+        uint256 currentIdle = reUSD.balanceOf(address(this));
+        uint256 targetIdle = (currentIdle * idleBufferBps) / BASIS_POINTS;
+
+        // Only deploy excess above the buffer
+        uint256 reUSDToLoop;
+        if (currentIdle > targetIdle) {
+            reUSDToLoop = currentIdle - targetIdle;
+            // Don't deploy more than requested
+            if (reUSDToLoop > _amount) {
+                reUSDToLoop = _amount;
+            }
+        } else {
+            // Already below buffer, don't deploy anything
+            return;
+        }
 
         // Loop to build leverage, starting with deposited reUSD
         for (uint256 i = 0; i < maxIterations; i++) {
@@ -321,12 +341,27 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     function _freeFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
+        // Calculate target: withdrawal amount + buffer for future operations
+        // Buffer is idleBufferBps% of remaining assets after withdrawal
+        // Approximate: _amount * idleBufferBps / (BASIS_POINTS - idleBufferBps)
+        // Simplified: just add idleBufferBps% of _amount as buffer
+        uint256 targetBuffer = (_amount * idleBufferBps) / BASIS_POINTS;
+        uint256 targetTotal = _amount + targetBuffer;
+
         // Loop to unwind positions (reverse of leverage loop)
         for (uint256 i = 0; i < maxIterations; i++) {
             uint256 reUSDBalance = reUSD.balanceOf(address(this));
+            uint256 reUSDBalanceAtLoopStart = reUSDBalance;
 
-            // Check if we've freed enough
-            if (reUSDBalance >= _amount) break;
+            // Track Curve debt at start to measure progress
+            uint256 curveDebtAtLoopStart = curveLLAMMA.loan_exists(address(this))
+                ? curveLLAMMA.debt(address(this))
+                : 0;
+
+            // Check if we've freed enough (including buffer for future withdrawals)
+            if (reUSDBalance >= targetTotal) {
+                break;
+            }
 
             // Step 1: Use reUSD to repay Resupply debt
             uint256 borrowShares = resupplyPair.userBorrowShares(address(this));
@@ -334,7 +369,6 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
                 uint256 repayAmount = reUSDBalance < debtAmount ? reUSDBalance : debtAmount;
 
-                // Convert repay amount to shares (round up to ensure full repayment)
                 uint256 repayShares = (repayAmount * borrowShares) / debtAmount;
                 if (repayShares > borrowShares) repayShares = borrowShares;
 
@@ -344,24 +378,19 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             }
 
             // Step 2: Withdraw crvUSD collateral from Resupply
-            // Note: userCollateralBalance returns cvcrvUSD vault shares, not underlying crvUSD
             uint256 crvUSDCollateralShares = resupplyPair.userCollateralBalance(address(this));
             borrowShares = resupplyPair.userBorrowShares(address(this));
 
             if (crvUSDCollateralShares > 0) {
-                // If debt remains, can only withdraw excess collateral (maintain solvency)
-                // If no debt, withdraw everything
                 uint256 withdrawableCrvUSDShares = crvUSDCollateralShares;
                 if (borrowShares > 0) {
                     uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
-                    // Need to keep enough collateral for remaining debt (at targetResupplyLTV)
+                    // Use target LTV to maintain solvency
                     uint256 minCrvUSDCollateralValue = (debtAmount * BASIS_POINTS) / targetResupplyLTV;
-                    // Convert collateral shares to underlying to compare
                     address collateralToken = resupplyPair.collateral();
                     uint256 crvUSDCollateralValue = _toCollateralAssets(collateralToken, crvUSDCollateralShares);
 
                     if (crvUSDCollateralValue > minCrvUSDCollateralValue) {
-                        // Calculate withdrawable in underlying terms, then convert back to shares
                         uint256 withdrawableCrvUSDValue = crvUSDCollateralValue - minCrvUSDCollateralValue;
                         withdrawableCrvUSDShares = _toCollateralShares(collateralToken, withdrawableCrvUSDValue);
                     } else {
@@ -369,7 +398,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                     }
                 }
 
-                if (withdrawableCrvUSDShares > minLoopAmount) {
+                if (withdrawableCrvUSDShares > 0) {
                     try resupplyPair.removeCollateral(withdrawableCrvUSDShares, address(this)) {} catch {}
                 }
             }
@@ -379,10 +408,27 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             uint256 curveDebt = curveLLAMMA.debt(address(this));
 
             if (curveDebt > 0 && crvUSDBalance > 0) {
-                uint256 repayAmount = crvUSDBalance < curveDebt ? crvUSDBalance : curveDebt;
+                // Check if Curve LTV is safe for withdrawal (< 85%)
+                // If not, prioritize Curve repayment over keeping crvUSD for swap
+                uint256[4] memory curveState = curveLLAMMA.user_state(address(this));
+                uint256 sreUSDCollateral = curveState[0];
+                uint256 collateralValue = sreUSD.convertToAssets(sreUSDCollateral);
+                uint256 safeCurveLTV = 8500;
+                uint256 minCollateralNeeded = (curveDebt * BASIS_POINTS) / safeCurveLTV;
 
-                // Use max int256 for max_active_band to allow repayment regardless of band position
-                try curveLLAMMA.repay(repayAmount, address(this), type(int256).max) {} catch {}
+                uint256 crvUSDToKeep;
+                if (collateralValue > minCollateralNeeded) {
+                    crvUSDToKeep = crvUSDBalance > minLoopAmount ? minLoopAmount : 0;
+                } else {
+                    crvUSDToKeep = 0;
+                }
+
+                uint256 crvUSDForRepay = crvUSDBalance - crvUSDToKeep;
+                uint256 repayAmount = crvUSDForRepay < curveDebt ? crvUSDForRepay : curveDebt;
+
+                if (repayAmount > 0) {
+                    try curveLLAMMA.repay(repayAmount, address(this), type(int256).max) {} catch {}
+                }
             }
 
             // Step 4: Withdraw sreUSD collateral from Curve
@@ -394,15 +440,12 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 if (sreUSDCollateral > 0) {
                     uint256 withdrawableSreUSDShares = sreUSDCollateral;
                     if (curveDebt > 0) {
-                        // Convert sreUSD shares to underlying value (reUSD ≈ crvUSD)
                         uint256 sreUSDCollateralValue = sreUSD.convertToAssets(sreUSDCollateral);
-
-                        // Calculate minimum collateral value needed (at targetCurveLTV)
-                        // minCollateralValue = debt / targetLTV (in reUSD/crvUSD terms)
-                        uint256 minSreUSDCollateralValue = (curveDebt * BASIS_POINTS) / targetCurveLTV;
+                        // Use 90% LTV to allow withdrawal after debt repayment
+                        uint256 safeCurveLTV = 9000;
+                        uint256 minSreUSDCollateralValue = (curveDebt * BASIS_POINTS) / safeCurveLTV;
 
                         if (sreUSDCollateralValue > minSreUSDCollateralValue) {
-                            // Calculate withdrawable value, then convert to shares
                             uint256 withdrawableSreUSDValue = sreUSDCollateralValue - minSreUSDCollateralValue;
                             withdrawableSreUSDShares = sreUSD.convertToShares(withdrawableSreUSDValue);
                         } else {
@@ -410,7 +453,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                         }
                     }
 
-                    if (withdrawableSreUSDShares > minLoopAmount) {
+                    if (withdrawableSreUSDShares > 0) {
                         try curveLLAMMA.remove_collateral(withdrawableSreUSDShares) {} catch {}
                     }
                 }
@@ -422,10 +465,26 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 try sreUSD.redeem(sreUSDBalance, address(this), address(this)) {} catch {}
             }
 
+            // Step 6: If we still have crvUSD, swap it to reUSD
+            crvUSDBalance = crvUSD.balanceOf(address(this));
+            if (crvUSDBalance > 0 && address(scrvUSDReUSDPool) != address(0)) {
+                uint256 scrvUSDShares = scrvUSD.deposit(crvUSDBalance, address(this));
+                if (scrvUSDShares > 0) {
+                    try scrvUSDReUSDPool.exchange(1, 0, scrvUSDShares, 0) {} catch {}
+                }
+            }
+
             // Check if we made progress this iteration
             uint256 newReUSDBalance = reUSD.balanceOf(address(this));
-            if (newReUSDBalance <= reUSDBalance + minLoopAmount) {
-                // No meaningful progress, exit to avoid infinite loop
+            uint256 newCurveDebt = curveLLAMMA.loan_exists(address(this))
+                ? curveLLAMMA.debt(address(this))
+                : 0;
+
+            // Any positive progress counts - no minimum threshold for deleveraging
+            bool reUSDProgress = newReUSDBalance > reUSDBalanceAtLoopStart;
+            bool curveDebtProgress = curveDebtAtLoopStart > 0 && newCurveDebt < curveDebtAtLoopStart;
+
+            if (!reUSDProgress && !curveDebtProgress) {
                 break;
             }
         }
@@ -657,16 +716,20 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * @notice Update loop parameters
      * @param _maxIterations New maximum iterations
      * @param _minLoopAmount New minimum loop amount
+     * @param _idleBufferBps Percentage of idle reUSD to keep as buffer (basis points, e.g., 500 = 5%)
      */
     function setLoopParameters(
         uint256 _maxIterations,
-        uint256 _minLoopAmount
+        uint256 _minLoopAmount,
+        uint256 _idleBufferBps
     ) external onlyManagement {
         require(_maxIterations > 0 && _maxIterations <= 50, "Invalid max iterations");
         require(_minLoopAmount > 0, "Invalid min loop amount");
+        require(_idleBufferBps <= 2000, "Buffer too high"); // Max 20%
 
         maxIterations = _maxIterations;
         minLoopAmount = _minLoopAmount;
+        idleBufferBps = _idleBufferBps;
     }
 
     /**
