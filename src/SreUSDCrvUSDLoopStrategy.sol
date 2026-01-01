@@ -341,12 +341,30 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     function _freeFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
-        // Calculate target: withdrawal amount + buffer for future operations
-        // Buffer is idleBufferBps% of remaining assets after withdrawal
-        // Approximate: _amount * idleBufferBps / (BASIS_POINTS - idleBufferBps)
-        // Simplified: just add idleBufferBps% of _amount as buffer
-        uint256 targetBuffer = (_amount * idleBufferBps) / BASIS_POINTS;
-        uint256 targetTotal = _amount + targetBuffer;
+        // Calculate buffer based on remaining assets after this withdrawal
+        uint256 currentIdle = reUSD.balanceOf(address(this));
+        uint256 totalAssets = _calculateTotalAssets(currentIdle);
+
+        // User will receive: currentIdle + _amount
+        // Remaining after withdrawal: totalAssets - userReceives
+        uint256 userReceives = currentIdle + _amount;
+        uint256 remainingAfter = totalAssets > userReceives ? totalAssets - userReceives : 0;
+
+        // If no assets remain after this withdrawal, close everything (no buffer needed)
+        bool isFullWithdrawal = (remainingAfter == 0);
+
+        // Buffer = X% of remaining assets (ensures future withdrawals can deleverage)
+        uint256 targetBuffer = 0;
+        if (!isFullWithdrawal) {
+            targetBuffer = (remainingAfter * idleBufferBps) / BASIS_POINTS;
+            if (targetBuffer < minLoopAmount) {
+                targetBuffer = minLoopAmount;
+            }
+        }
+
+        // Target: userReceives + buffer, so after transfer buffer remains
+        // For full withdrawal, we'll keep trying until positions are closed
+        uint256 targetTotal = userReceives + targetBuffer;
 
         // Loop to unwind positions (reverse of leverage loop)
         for (uint256 i = 0; i < maxIterations; i++) {
@@ -381,9 +399,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
             if (crvUSDCollateralShares > 0) {
                 uint256 withdrawableCrvUSDShares = crvUSDCollateralShares;
+
+                // Must maintain LTV if there's debt (protocol requirement)
+                // Only skip LTV check when debt is fully repaid
                 if (borrowShares > 0) {
                     uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
-                    // Use target LTV to maintain solvency
                     uint256 minCrvUSDCollateralValue = (debtAmount * BASIS_POINTS) / targetResupplyLTV;
                     address collateralToken = resupplyPair.collateral();
                     uint256 crvUSDCollateralValue = _toCollateralAssets(collateralToken, crvUSDCollateralShares);
@@ -395,6 +415,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                         withdrawableCrvUSDShares = 0;
                     }
                 }
+                // If no debt, withdraw everything
 
                 if (withdrawableCrvUSDShares > 0) {
                     try resupplyPair.removeCollateral(withdrawableCrvUSDShares, address(this)) {} catch {}
@@ -404,6 +425,27 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             // Step 3: Use crvUSD to repay Curve debt
             uint256 crvUSDBalance = crvUSD.balanceOf(address(this));
             uint256 curveDebt = curveLLAMMA.debt(address(this));
+
+            // If we need crvUSD to repay Curve and don't have enough,
+            // swap reUSD → crvUSD via scrvUSD pool
+            // For full withdrawals: swap all available reUSD (aggressive close)
+            // For partial withdrawals: only swap for small dust amounts
+            if (curveDebt > 0 && crvUSDBalance < curveDebt && address(scrvUSDReUSDPool) != address(0)) {
+                bool shouldSwap = isFullWithdrawal || curveDebt < minLoopAmount;
+                if (shouldSwap) {
+                    uint256 reUSDForSwap = reUSD.balanceOf(address(this));
+                    if (reUSDForSwap > 0) {
+                        // reUSD → scrvUSD via pool (index 0 → 1)
+                        try scrvUSDReUSDPool.exchange(0, 1, reUSDForSwap, 0) returns (uint256 scrvUSDReceived) {
+                            // scrvUSD → crvUSD via redeem
+                            if (scrvUSDReceived > 0) {
+                                try scrvUSD.redeem(scrvUSDReceived, address(this), address(this)) {} catch {}
+                            }
+                        } catch {}
+                        crvUSDBalance = crvUSD.balanceOf(address(this));
+                    }
+                }
+            }
 
             if (curveDebt > 0 && crvUSDBalance > 0) {
                 uint256 repayAmount = crvUSDBalance < curveDebt ? crvUSDBalance : curveDebt;
@@ -418,9 +460,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
                 if (sreUSDCollateral > 0) {
                     uint256 withdrawableSreUSDShares = sreUSDCollateral;
+
+                    // Must maintain LTV if there's debt (protocol requirement)
+                    // Only skip LTV check when debt is fully repaid
                     if (curveDebt > 0) {
                         uint256 sreUSDCollateralValue = sreUSD.convertToAssets(sreUSDCollateral);
-                        // Use 90% LTV to allow withdrawal after debt repayment
                         uint256 safeCurveLTV = 9000;
                         uint256 minSreUSDCollateralValue = (curveDebt * BASIS_POINTS) / safeCurveLTV;
 
@@ -431,6 +475,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                             withdrawableSreUSDShares = 0;
                         }
                     }
+                    // If no debt, withdraw everything
 
                     if (withdrawableSreUSDShares > 0) {
                         try curveLLAMMA.remove_collateral(withdrawableSreUSDShares) {} catch {}
@@ -549,6 +594,37 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         } catch {
             return shares;
         }
+    }
+
+    /**
+     * @notice Calculate total assets: idle + collateral value - debt
+     * @param idle Current idle reUSD balance
+     * @return Total assets in reUSD terms
+     */
+    function _calculateTotalAssets(uint256 idle) internal view returns (uint256) {
+        // Get sreUSD collateral from Curve LLAMMA
+        uint256 sreUSDCollateral = 0;
+        if (curveLLAMMA.loan_exists(address(this))) {
+            uint256[4] memory state = curveLLAMMA.user_state(address(this));
+            sreUSDCollateral = state[0];
+        }
+
+        // Convert sreUSD to reUSD value
+        uint256 sreUSDValueInReUSD = sreUSD.convertToAssets(sreUSDCollateral);
+
+        // Get reUSD debt from Resupply
+        uint256 reUSDDebt = 0;
+        uint256 borrowShares = resupplyPair.userBorrowShares(address(this));
+        if (borrowShares > 0) {
+            reUSDDebt = resupplyPair.toBorrowAmount(borrowShares, true, false);
+        }
+
+        // Total = Idle + Collateral Value - Debt
+        uint256 total = idle + sreUSDValueInReUSD;
+        if (total > reUSDDebt) {
+            return total - reUSDDebt;
+        }
+        return 0;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -808,8 +884,10 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         scrvUSD = IERC4626(_scrvUSD);
         scrvUSDReUSDPool = ICurvePool(_pool);
 
-        // Approve scrvUSD for the pool
+        // Approve scrvUSD for the pool (for scrvUSD → reUSD swaps)
         ERC20(_scrvUSD).safeApprove(_pool, type(uint256).max);
+        // Approve reUSD for the pool (for reUSD → scrvUSD swaps in dust cleanup)
+        reUSD.safeApprove(_pool, type(uint256).max);
         // Approve crvUSD for scrvUSD vault
         crvUSD.safeApprove(_scrvUSD, type(uint256).max);
     }

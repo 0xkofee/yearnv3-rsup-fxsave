@@ -188,22 +188,36 @@ contract LoopStrategyForkTest is Test {
 
         vm.startPrank(user2);
         IERC20(REUSD).approve(address(loopStrategy), 5_000e18);
-        strategyVault.deposit(5_000e18, user2);
+        uint256 shares2 = strategyVault.deposit(5_000e18, user2);
         vm.stopPrank();
 
         vm.startPrank(user3);
         IERC20(REUSD).approve(address(loopStrategy), 3_000e18);
-        strategyVault.deposit(3_000e18, user3);
+        uint256 shares3 = strategyVault.deposit(3_000e18, user3);
         vm.stopPrank();
 
         assertGt(IERC20(REUSD).balanceOf(address(loopStrategy)), 0, "Should have idle buffer");
 
-        vm.startPrank(user1);
-        uint256 assetsReceived = IStrategyWithRedeem(address(loopStrategy)).redeem(shares1, user1, user1);
-        vm.stopPrank();
-
-        assertGt(assetsReceived, 9500e18, "User1 should receive most of deposit");
+        // User1 withdraws
+        vm.prank(user1);
+        uint256 assets1 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares1, user1, user1);
+        assertGt(assets1, 9500e18, "User1 should receive most of deposit");
         assertEq(IERC20(address(loopStrategy)).balanceOf(user1), 0, "User1 should have no shares");
+
+        // User2 withdraws
+        vm.prank(user2);
+        uint256 assets2 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares2, user2, user2);
+        assertGt(assets2, 4750e18, "User2 should receive most of deposit");
+        assertEq(IERC20(address(loopStrategy)).balanceOf(user2), 0, "User2 should have no shares");
+
+        // User3 withdraws
+        vm.prank(user3);
+        uint256 assets3 = IStrategyWithRedeem(address(loopStrategy)).redeem(shares3, user3, user3);
+        assertGt(assets3, 2850e18, "User3 should receive most of deposit");
+        assertEq(IERC20(address(loopStrategy)).balanceOf(user3), 0, "User3 should have no shares");
+
+        // Strategy should be empty
+        assertEq(strategyVault.totalAssets(), 0, "Strategy should be empty");
     }
 
     /*//////////////////////////////////////////////////////////////
