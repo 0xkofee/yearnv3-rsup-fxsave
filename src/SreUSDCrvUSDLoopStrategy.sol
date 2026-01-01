@@ -368,9 +368,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             if (borrowShares > 0 && reUSDBalance > 0) {
                 uint256 debtAmount = resupplyPair.toBorrowAmount(borrowShares, true, false);
                 uint256 repayAmount = reUSDBalance < debtAmount ? reUSDBalance : debtAmount;
-
                 uint256 repayShares = (repayAmount * borrowShares) / debtAmount;
-                if (repayShares > borrowShares) repayShares = borrowShares;
 
                 if (repayShares > 0) {
                     try resupplyPair.repay(repayShares, address(this)) {} catch {}
@@ -408,27 +406,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             uint256 curveDebt = curveLLAMMA.debt(address(this));
 
             if (curveDebt > 0 && crvUSDBalance > 0) {
-                // Check if Curve LTV is safe for withdrawal (< 85%)
-                // If not, prioritize Curve repayment over keeping crvUSD for swap
-                uint256[4] memory curveState = curveLLAMMA.user_state(address(this));
-                uint256 sreUSDCollateral = curveState[0];
-                uint256 collateralValue = sreUSD.convertToAssets(sreUSDCollateral);
-                uint256 safeCurveLTV = 8500;
-                uint256 minCollateralNeeded = (curveDebt * BASIS_POINTS) / safeCurveLTV;
-
-                uint256 crvUSDToKeep;
-                if (collateralValue > minCollateralNeeded) {
-                    crvUSDToKeep = crvUSDBalance > minLoopAmount ? minLoopAmount : 0;
-                } else {
-                    crvUSDToKeep = 0;
-                }
-
-                uint256 crvUSDForRepay = crvUSDBalance - crvUSDToKeep;
-                uint256 repayAmount = crvUSDForRepay < curveDebt ? crvUSDForRepay : curveDebt;
-
-                if (repayAmount > 0) {
-                    try curveLLAMMA.repay(repayAmount, address(this), type(int256).max) {} catch {}
-                }
+                uint256 repayAmount = crvUSDBalance < curveDebt ? crvUSDBalance : curveDebt;
+                try curveLLAMMA.repay(repayAmount, address(this), type(int256).max) {} catch {}
             }
 
             // Step 4: Withdraw sreUSD collateral from Curve
