@@ -191,6 +191,14 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     //////////////////////////////////////////////////////////////*/
 
     event FullWithdrawal(uint256 amount, uint256 vaultTotalAssets);
+    event LeverageIteration(uint256 iteration, uint256 reUSDToLoop);
+    event DeleverageIteration(
+        uint256 iteration,
+        uint256 reUSDBalance,
+        uint256 targetTotal,
+        uint256 curveDebt,
+        uint256 resupplyDebt
+    );
 
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
@@ -304,6 +312,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             // Stop if amount becomes too small (dust)
             if (reUSDToLoop < minLoopAmount) break;
 
+            emit LeverageIteration(i, reUSDToLoop);
+
             // a. Deposit reUSD → get sreUSD shares
             // Note: Exchange rate is NOT 1:1, sreUSD accrues value over time
             uint256 sreUSDShares = sreUSD.deposit(reUSDToLoop, address(this));
@@ -390,6 +400,12 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             uint256 curveDebtAtLoopStart = curveLLAMMA.loan_exists(address(this))
                 ? curveLLAMMA.debt(address(this))
                 : 0;
+
+            // Emit iteration state for debugging
+            uint256 resupplyDebt = resupplyPair.userBorrowShares(address(this)) > 0
+                ? resupplyPair.toBorrowAmount(resupplyPair.userBorrowShares(address(this)), true, false)
+                : 0;
+            emit DeleverageIteration(i, reUSDBalance, targetTotal, curveDebtAtLoopStart, resupplyDebt);
 
             // Check if we've freed enough (including buffer for future withdrawals)
             if (reUSDBalance >= targetTotal) {

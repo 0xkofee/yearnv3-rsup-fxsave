@@ -42,6 +42,14 @@ contract LoopStrategyForkTest is Test {
 
     // Events (must match strategy events for vm.expectEmit)
     event FullWithdrawal(uint256 amount, uint256 vaultTotalAssets);
+    event LeverageIteration(uint256 iteration, uint256 reUSDToLoop);
+    event DeleverageIteration(
+        uint256 iteration,
+        uint256 reUSDBalance,
+        uint256 targetTotal,
+        uint256 curveDebt,
+        uint256 resupplyDebt
+    );
 
     // Real mainnet addresses
     address public constant REUSD = 0x57aB1E0003F623289CD798B1824Be09a793e4Bec;
@@ -394,6 +402,169 @@ contract LoopStrategyForkTest is Test {
 
         emit log_named_decimal_uint("Curve debt after", curveDebtAfter, 18);
         emit log_named_decimal_uint("Resupply shares after", resupplySharesAfter, 18);
+    }
+
+    /// @notice Test: Show iteration-by-iteration state during failed deleverage
+    /// @dev Demonstrates how funds can be trapped when maxIterations is too low
+    function testFork_DeleverageIterations_ShowState() public {
+        // Setup: User deposits
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        uint256 shares = strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        emit log("=== Initial State ===");
+        emit log_named_decimal_uint("User deposited", INITIAL_DEPOSIT, 18);
+        emit log_named_decimal_uint("Shares received", shares, 18);
+
+        // Get initial position state
+        uint256 curveDebtBefore = ICurveLLAMMA(CURVE_LLAMMA).debt(address(loopStrategy));
+        uint256 resupplyDebtBefore = IResupply(RESUPPLY_PAIR).toBorrowAmount(
+            IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy)), true, false
+        );
+        uint256 idleBefore = IERC20(REUSD).balanceOf(address(loopStrategy));
+
+        emit log_named_decimal_uint("Idle reUSD", idleBefore, 18);
+        emit log_named_decimal_uint("Curve debt", curveDebtBefore, 18);
+        emit log_named_decimal_uint("Resupply debt", resupplyDebtBefore, 18);
+
+        // Keep default 30 iterations to show full deleverage attempt
+        emit log("");
+        emit log("=== Attempting Full Withdrawal with 30 iterations ===");
+        emit log("(Will show each iteration's state via events)");
+        emit log("");
+
+        // Record logs to capture DeleverageIteration events
+        vm.recordLogs();
+
+        // Try withdrawal - will revert but we capture events first
+        vm.prank(user);
+        try IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user) returns (uint256 assets) {
+            emit log_named_decimal_uint("Withdrawal succeeded with", assets, 18);
+        } catch {
+            emit log("Withdrawal REVERTED (as expected - insufficient funds freed)");
+        }
+
+        // Extract and display iteration events
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 iterationSelector = keccak256("DeleverageIteration(uint256,uint256,uint256,uint256,uint256)");
+
+        emit log("");
+        emit log("=== Iteration-by-Iteration State ===");
+
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == iterationSelector) {
+                (uint256 iteration, uint256 reUSDBalance, uint256 targetTotal, uint256 curveDebt, uint256 resupplyDebt) =
+                    abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256));
+
+                emit log("");
+                emit log_named_uint("Iteration", iteration);
+                emit log_named_decimal_uint("  reUSD balance", reUSDBalance, 18);
+                emit log_named_decimal_uint("  Target total", targetTotal, 18);
+                emit log_named_decimal_uint("  Curve debt", curveDebt, 18);
+                emit log_named_decimal_uint("  Resupply debt", resupplyDebt, 18);
+
+                if (reUSDBalance < targetTotal) {
+                    uint256 shortfall = targetTotal - reUSDBalance;
+                    uint256 pctShort = (shortfall * 100) / targetTotal;
+                    emit log_named_decimal_uint("  SHORTFALL", shortfall, 18);
+                    emit log_named_uint("  Shortfall %", pctShort);
+                }
+            }
+        }
+
+        emit log("");
+        emit log("=== Analysis ===");
+        emit log("Shows full 30-iteration deleverage attempt.");
+        emit log("If it completes, withdrawal succeeds. If not, the slippage check protects user.");
+    }
+
+    /// @notice Test: Show leverage vs deleverage asymmetry
+    /// @dev Demonstrates why deposits are fast but withdrawals are slow
+    function testFork_LeverageVsDeleverageAsymmetry() public {
+        uint256 depositAmount = 10_000 ether;
+
+        emit log("=== Leverage vs Deleverage Asymmetry ===");
+        emit log("");
+        emit log("LEVERAGE: Each iteration reinvests ~87% of previous (0.95 * 0.92)");
+        emit log("DELEVERAGE: Each iteration frees only excess above min LTV");
+        emit log("");
+
+        // Create fresh strategy
+        SreUSDCrvUSDLoopStrategy testStrategy = new SreUSDCrvUSDLoopStrategy(
+            REUSD, SREUSD, CRVUSD, CURVE_LLAMMA, RESUPPLY_PAIR, "Test Strategy"
+        );
+        IStrategy(address(testStrategy)).setKeeper(address(this));
+        testStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
+
+        deal(REUSD, user, depositAmount);
+
+        // Record leverage events
+        vm.recordLogs();
+
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(testStrategy), depositAmount);
+        uint256 shares = IStrategy(address(testStrategy)).deposit(depositAmount, user);
+        vm.stopPrank();
+
+        // Extract leverage iterations
+        Vm.Log[] memory leverageLogs = vm.getRecordedLogs();
+        bytes32 leverageSelector = keccak256("LeverageIteration(uint256,uint256)");
+
+        emit log("=== LEVERAGE (Deposit) ===");
+        for (uint256 i = 0; i < leverageLogs.length; i++) {
+            if (leverageLogs[i].topics[0] == leverageSelector) {
+                (uint256 iteration, uint256 reUSDToLoop) =
+                    abi.decode(leverageLogs[i].data, (uint256, uint256));
+                emit log_named_uint("Iteration", iteration);
+                emit log_named_decimal_uint("  reUSD looped", reUSDToLoop, 18);
+            }
+        }
+
+        emit log("");
+        emit log("=== DELEVERAGE (Withdraw) ===");
+
+        // Record deleverage events
+        vm.recordLogs();
+
+        vm.prank(user);
+        uint256 assets = IStrategyWithRedeem(address(testStrategy)).redeem(shares, user, user);
+
+        // Extract deleverage iterations
+        Vm.Log[] memory deleverageLogs = vm.getRecordedLogs();
+        bytes32 deleverageSelector = keccak256("DeleverageIteration(uint256,uint256,uint256,uint256,uint256)");
+
+        uint256 leverageCount = 0;
+        uint256 deleverageCount = 0;
+
+        for (uint256 i = 0; i < leverageLogs.length; i++) {
+            if (leverageLogs[i].topics[0] == leverageSelector) leverageCount++;
+        }
+
+        for (uint256 i = 0; i < deleverageLogs.length; i++) {
+            if (deleverageLogs[i].topics[0] == deleverageSelector) {
+                deleverageCount++;
+                (uint256 iteration, uint256 reUSDBalance, uint256 targetTotal, , ) =
+                    abi.decode(deleverageLogs[i].data, (uint256, uint256, uint256, uint256, uint256));
+                emit log_named_uint("Iteration", iteration);
+                emit log_named_decimal_uint("  reUSD freed so far", reUSDBalance, 18);
+                if (reUSDBalance < targetTotal) {
+                    emit log_named_decimal_uint("  Still need", targetTotal - reUSDBalance, 18);
+                }
+            }
+        }
+
+        emit log("");
+        emit log("=== SUMMARY ===");
+        emit log_named_decimal_uint("Deposited", depositAmount, 18);
+        emit log_named_decimal_uint("Received", assets, 18);
+        emit log_named_uint("Leverage iterations", leverageCount);
+        emit log_named_uint("Deleverage iterations", deleverageCount);
+        emit log("");
+        emit log("Deleverage needs MORE iterations because:");
+        emit log("- LTV constraints limit how much collateral we can withdraw each step");
+        emit log("- Must repay debt first, but need collateral to get funds to repay");
+        emit log("- Each step only frees the EXCESS above minimum safe LTV");
     }
 
     /*//////////////////////////////////////////////////////////////

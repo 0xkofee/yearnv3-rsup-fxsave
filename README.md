@@ -111,3 +111,165 @@ If the deployments do not end at the same address you can also manually send the
 - [Awesome Foundry](https://github.com/crisgarner/awesome-foundry)
 - [Foundry Book](https://book.getfoundry.sh/)
 - [Learn Foundry Tutorial](https://www.youtube.com/watch?v=Rp_V7bYiTCM)
+
+---
+
+# SreUSD/crvUSD Loop Strategy
+
+## Leverage vs Deleverage Asymmetry Problem
+
+This strategy builds leveraged positions by looping through Curve LLAMMA and Resupply. A critical issue exists: **leverage is fast, but deleverage is slow**.
+
+### The Problem
+
+**Leverage (Deposit):**
+```
+Each iteration:
+1. Deposit collateral (e.g., 10k sreUSD)
+2. Borrow at 95% LTV → get 9.5k crvUSD
+3. Deposit crvUSD, borrow at 92% LTV → get 8.7k reUSD
+4. Loop with 8.7k (87% of previous)
+
+Pattern: Geometric decay → converges fast in ~14 iterations
+```
+
+**Deleverage (Withdraw):**
+```
+Each iteration:
+1. Use available reUSD to repay debt
+2. Withdraw collateral - BUT limited by LTV constraints
+3. Can only withdraw EXCESS above minimum safe LTV
+4. Convert to reUSD, repeat
+
+Pattern: Slow linear climb → needs ~16+ iterations for same position
+```
+
+### Why Deleverage is Slower
+
+| Phase | Pattern | Constraint |
+|-------|---------|------------|
+| Leverage | Borrow 87% of new collateral each step | Only limited by max LTV |
+| Deleverage | Free only excess above min LTV each step | Must maintain LTV while unwinding |
+
+**Example:** At 85% LTV with 80% minimum:
+- Can only withdraw 5% of position per iteration
+- But leverage can borrow 87% per iteration
+
+### Real Test Data
+
+For a 10,000 reUSD deposit:
+- **Leverage:** 14 iterations (9k → 7.6k → 6.5k → ... → done)
+- **Deleverage:** 16 iterations (1k → 736 → 890 → ... → 10k)
+
+Note iteration 1 of deleverage: balance **dropped** from 1,000 to 736! We spent 1,000 on debt repayment but LTV only allowed 736 of collateral withdrawal.
+
+### Deposit Size Limits
+
+With `maxIterations = 30`:
+- 10,000 reUSD: ✓ Works (15 iterations)
+- 20,000 reUSD: ✓ Works (30 iterations)
+- 21,000 reUSD: ✓ Works (just fits)
+- 21,500 reUSD: ✗ Fails (needs 31+ iterations)
+
+**Roughly ~700 reUSD freed per deleverage iteration at current LTV settings.**
+
+### Protection Mechanism
+
+The strategy includes a slippage check at the end of `_freeFunds`:
+
+```solidity
+if (finalBalance < userReceives) {
+    uint256 shortfall = userReceives - finalBalance;
+    uint256 maxSlippage = userReceives / 100; // 1%
+    require(shortfall <= maxSlippage, "Deleverage failed: insufficient funds freed");
+}
+```
+
+This prevents silent partial withdrawals where users would lose funds without any error.
+
+### Potential Solution: Flash Loan Deleverage
+
+The iterative deleverage is slow because we're trapped in a cycle:
+- Need to repay debt to withdraw collateral
+- Need collateral to get funds to repay debt
+
+**Flash loans break this cycle.**
+
+#### Current Position Structure
+
+```
+User deposits reUSD
+    ↓
+reUSD → sreUSD (via deposit)
+    ↓
+sreUSD deposited to Curve LLAMMA as collateral
+    ↓
+Borrow crvUSD from Curve (debt #1)
+    ↓
+crvUSD deposited to Resupply as collateral
+    ↓
+Borrow reUSD from Resupply (debt #2)
+    ↓
+Loop with borrowed reUSD...
+```
+
+#### Flash Loan Deleverage Flow
+
+```
+1. Flash loan reUSD (amount = Resupply debt)
+2. Repay ALL Resupply reUSD debt → debt #2 = 0
+3. Withdraw ALL crvUSD collateral from Resupply (no LTV constraint!)
+4. Repay ALL Curve crvUSD debt → debt #1 = 0
+5. Withdraw ALL sreUSD collateral from Curve (no LTV constraint!)
+6. Redeem sreUSD → reUSD
+7. Repay flash loan
+8. Return remainder to user
+```
+
+#### Comparison
+
+| Metric | Iterative | Flash Loan |
+|--------|-----------|------------|
+| Iterations | 15-30 | 1 |
+| Gas cost | High (~25M gas) | Lower (~5M gas) |
+| Deposit limit | ~21k reUSD | Unlimited* |
+| Complexity | Simple loops | Callback handling |
+| External dependency | None | Flash loan provider |
+
+*Limited only by flash loan liquidity
+
+#### Implementation Considerations
+
+1. **Flash Loan Sources:**
+   - Aave V3 (0.05% fee for most assets)
+   - Balancer (no fee)
+   - Uniswap V3 (0.3% swap fee if using flash swap)
+   - Curve (if pool has sufficient liquidity)
+
+2. **Callback Pattern:**
+   ```solidity
+   function executeOperation(
+       address[] calldata assets,
+       uint256[] calldata amounts,
+       uint256[] calldata premiums,
+       address initiator,
+       bytes calldata params
+   ) external returns (bool) {
+       // 1. Repay Resupply debt
+       // 2. Withdraw crvUSD collateral
+       // 3. Repay Curve debt
+       // 4. Withdraw sreUSD collateral
+       // 5. Redeem sreUSD → reUSD
+       // 6. Approve repayment
+       return true;
+   }
+   ```
+
+3. **Partial Deleverage:**
+   - For partial withdrawals, calculate proportional debt to repay
+   - Flash loan only the needed amount
+   - Leave remaining position intact
+
+4. **Fallback:**
+   - Keep iterative deleverage as fallback if flash loan fails
+   - Useful for small withdrawals where flash loan overhead isn't worth it
