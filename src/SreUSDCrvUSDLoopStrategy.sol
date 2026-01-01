@@ -527,6 +527,18 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
                 break;
             }
         }
+
+        // Verify user receives their fair share - revert if significantly short
+        // This prevents silent partial withdrawals that lose user funds
+        // Note: We check against userReceives (what user expects), not targetTotal (which includes buffer)
+        // The buffer is nice-to-have for future withdrawals, but user's share is critical
+        uint256 finalBalance = reUSD.balanceOf(address(this));
+        if (finalBalance < userReceives) {
+            uint256 shortfall = userReceives - finalBalance;
+            // Allow up to 1% slippage due to cumulative swap fees across deleverage iterations
+            uint256 maxSlippage = userReceives / 100;
+            require(shortfall <= maxSlippage, "Deleverage failed: insufficient funds freed");
+        }
     }
 
     /**

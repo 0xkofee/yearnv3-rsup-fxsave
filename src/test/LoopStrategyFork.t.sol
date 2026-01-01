@@ -278,6 +278,125 @@ contract LoopStrategyForkTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        DELEVERAGE STUCK SCENARIOS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Test: Can withdrawal get stuck if we drain idle buffer first?
+    /// @dev Scenario: Small withdrawals drain idle, then large withdrawal can't deleverage
+    function testFork_WithdrawalStuck_IdleDrained() public {
+        // Setup: User deposits
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        uint256 shares = strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        uint256 idleBefore = IERC20(REUSD).balanceOf(address(loopStrategy));
+        emit log_named_decimal_uint("Idle buffer after deposit", idleBefore, 18);
+
+        // Drain idle with small withdrawal (less than idle)
+        uint256 smallWithdrawShares = (shares * 5) / 100; // 5% withdrawal
+        vm.prank(user);
+        uint256 smallAssets = IStrategyWithRedeem(address(loopStrategy)).redeem(smallWithdrawShares, user, user);
+        emit log_named_decimal_uint("Small withdrawal received", smallAssets, 18);
+
+        uint256 idleAfter = IERC20(REUSD).balanceOf(address(loopStrategy));
+        emit log_named_decimal_uint("Idle buffer after small withdraw", idleAfter, 18);
+
+        // Now try larger withdrawal - does it succeed?
+        uint256 remainingShares = IERC20(address(loopStrategy)).balanceOf(user);
+        uint256 largeWithdrawShares = (remainingShares * 80) / 100; // 80% of remaining
+
+        emit log_named_decimal_uint("Attempting large withdrawal shares", largeWithdrawShares, 18);
+
+        vm.prank(user);
+        uint256 largeAssets = IStrategyWithRedeem(address(loopStrategy)).redeem(largeWithdrawShares, user, user);
+
+        emit log_named_decimal_uint("Large withdrawal received", largeAssets, 18);
+
+        // Check: Did user receive expected amount? (allow >= since 80% of remaining after 5% = 76%)
+        uint256 expectedMin = (INITIAL_DEPOSIT * 76 / 100) * 95 / 100; // 76% of deposit, allow 5% slippage
+        assertGe(largeAssets, expectedMin, "Large withdrawal should succeed");
+    }
+
+    /// @notice Test: Insufficient iterations now REVERTS instead of silent partial withdrawal
+    /// @dev After fix, when maxIterations is too low, withdrawal reverts protecting user funds
+    function testFork_WithdrawalStuck_MaxIterationsReached() public {
+        // Setup: User deposits
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        uint256 shares = strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        uint256 userReUSDBefore = IERC20(REUSD).balanceOf(user);
+
+        // Reduce maxIterations to very low value
+        vm.prank(management);
+        loopStrategy.setLoopParameters(
+            3, // Only 3 iterations - not enough to fully deleverage
+            loopStrategy.minLoopAmount(),
+            loopStrategy.minBufferAmount(),
+            loopStrategy.idleBufferBps()
+        );
+
+        // Try full withdrawal with limited iterations - should REVERT now
+        vm.prank(user);
+        vm.expectRevert("Deleverage failed: insufficient funds freed");
+        IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user);
+
+        // User should still have their shares (withdrawal failed)
+        uint256 userSharesAfter = IERC20(address(loopStrategy)).balanceOf(user);
+        assertEq(userSharesAfter, shares, "User should still have shares after failed withdrawal");
+
+        // User's reUSD balance should be unchanged
+        uint256 userReUSDAfter = IERC20(REUSD).balanceOf(user);
+        assertEq(userReUSDAfter, userReUSDBefore, "User reUSD should be unchanged");
+
+        emit log("FIX CONFIRMED: Withdrawal reverts instead of silently losing funds");
+    }
+
+    /// @notice Test: Progress check - does minimal progress prevent exit?
+    /// @dev The no-progress check allows even 1 wei progress to continue
+    function testFork_WithdrawalStuck_MinimalProgress() public {
+        // This test checks if the progress detection is too lenient
+
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        uint256 shares = strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        // Get position info before withdrawal
+        uint256 curveDebtBefore = ICurveLLAMMA(CURVE_LLAMMA).debt(address(loopStrategy));
+        uint256 resupplySharesBefore = IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy));
+
+        emit log_named_decimal_uint("Curve debt before", curveDebtBefore, 18);
+        emit log_named_decimal_uint("Resupply shares before", resupplySharesBefore, 18);
+
+        // Withdraw 95% - leaves small remainder that may be hard to unwind
+        uint256 withdrawShares = (shares * 95) / 100;
+
+        uint256 gasBefore = gasleft();
+        vm.prank(user);
+        uint256 assets = IStrategyWithRedeem(address(loopStrategy)).redeem(withdrawShares, user, user);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        emit log_named_decimal_uint("Withdrawal received", assets, 18);
+        emit log_named_uint("Gas used", gasUsed);
+
+        // High gas usage might indicate many iterations (minimal progress per iteration)
+        // Normal deleverage: ~5-10 iterations
+        // Stuck/slow deleverage: 20-30 iterations
+        if (gasUsed > 5_000_000) {
+            emit log("WARNING: High gas usage suggests many iterations (potential stuck scenario)");
+        }
+
+        uint256 curveDebtAfter = ICurveLLAMMA(CURVE_LLAMMA).debt(address(loopStrategy));
+        uint256 resupplySharesAfter = IResupply(RESUPPLY_PAIR).userBorrowShares(address(loopStrategy));
+
+        emit log_named_decimal_uint("Curve debt after", curveDebtAfter, 18);
+        emit log_named_decimal_uint("Resupply shares after", resupplySharesAfter, 18);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         REWARD HARVEST TESTS
     //////////////////////////////////////////////////////////////*/
 
