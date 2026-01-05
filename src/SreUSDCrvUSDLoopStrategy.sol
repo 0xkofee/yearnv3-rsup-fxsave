@@ -229,13 +229,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
     // Target LTV parameters (basis points: 10000 = 100%)
     uint256 public targetResupplyLTV;   // Target: 9200 (92%)
-    uint256 public targetCurveLTV;      // Target: 9500 (95%)
+    // Curve LTV is calculated dynamically: (100% - loan_discount - curveLTVBuffer)
+    uint256 public curveLTVBuffer;      // Buffer below max LTV (default: 600 = 6%)
 
     // Protocol maximum LTVs (used to validate setter inputs)
     uint256 public constant PROTOCOL_MAX_RESUPPLY_LTV = 9500;  // 95% - Resupply protocol max
-    // 96% max from Curve: LTV = 100% - loan_discount(2%) - N/(2*A)
-    // where N = number of bands, A = amplification parameter
-    uint256 public constant PROTOCOL_MAX_CURVE_LTV = 9600;
     uint256 public constant BASIS_POINTS = 10000;
 
     /*//////////////////////////////////////////////////////////////
@@ -243,14 +241,9 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     //////////////////////////////////////////////////////////////*/
 
     event FullWithdrawal(uint256 amount, uint256 vaultTotalAssets);
-    event LeverageIteration(uint256 iteration, uint256 reUSDToLoop);
-    event DeleverageIteration(
-        uint256 iteration,
-        uint256 reUSDBalance,
-        uint256 targetTotal,
-        uint256 curveDebt,
-        uint256 resupplyDebt
-    );
+    event BufferParked(uint256 reUSDAmount, uint256 scrvUSDReceived);
+    event BufferSwept(uint256 scrvUSDAmount, uint256 reUSDReceived);
+    event LossCalculated(uint256 totalBefore, uint256 totalAfter, uint256 actualLoss, uint256 targetIdle);
 
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
@@ -289,6 +282,12 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     int128 public crvUSDIndexInPool;                    // Index of crvUSD in the swap pool (0)
     int128 public usdcIndexInPool;                      // Index of USDC in the swap pool (1)
 
+    // scrvUSD buffer for loss mechanism
+    // When freeing funds, excess reUSD is parked as scrvUSD to hide it from idle balance
+    // This ensures each user pays their own deleverage costs via Yearn V3's loss mechanism
+    // Using scrvUSD instead of crvUSD: fewer swaps (less slippage) + earns yield while parked
+    uint256 public scrvUSDBuffer;                       // Amount of scrvUSD parked as buffer
+
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -316,9 +315,9 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         curveLLAMMA = ICurveLLAMMA(_curveLLAMMA);
         resupplyPair = IResupply(_resupplyPair);
 
-        // Set default target LTVs (used for both leverage and deleverage)
-        targetCurveLTV = 9500;     // 95% for Curve LLAMMA
+        // Set default target LTVs
         targetResupplyLTV = 9200;  // 92% for Resupply
+        curveLTVBuffer = 600;      // 6% buffer below Curve's max (accounts for bands + safety)
 
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
@@ -344,31 +343,41 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     /**
      * @notice Deploy funds into the leverage strategy using looping
      * @param _amount Amount of reUSD to deploy
-     * @dev Loops to build leverage position, starting with deposited reUSD
-     *      Creates buy pressure on reUSD which helps the peg
-     *      Stops when amount falls below minLoopAmount (dust threshold)
+     * @dev Loops to build leverage position, starting with deposited reUSD.
+     *      First sweeps any crvUSD buffer from previous withdrawals.
+     *      Creates buy pressure on reUSD which helps the peg.
+     *      Stops when amount falls below minLoopAmount (dust threshold).
      */
     function _deployFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
-        // Deploy all available funds (no idle buffer needed with flash loan deleverage)
-        uint256 currentIdle = reUSD.balanceOf(address(this));
-        uint256 reUSDToLoop = currentIdle > _amount ? _amount : currentIdle;
+        // First, sweep any scrvUSD buffer from previous withdrawals back to reUSD
+        // This recovers excess funds that were parked to implement loss mechanism
+        _sweepScrvUSDBuffer();
+
+        // Deploy all available funds (including swept buffer)
+        uint256 reUSDToLoop = reUSD.balanceOf(address(this));
+
+        // Query Curve's loan_discount to calculate safe LTV
+        // loan_discount is in 1e18 scale (e.g., 2e16 = 2%)
+        // safeLTV = 100% - loan_discount - curveLTVBuffer
+        // curveLTVBuffer accounts for bands effect + safety margin
+        uint256 loanDiscount = curveLLAMMA.loan_discount();
+        uint256 safeCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
 
         // Loop to build leverage, starting with deposited reUSD
         for (uint256 i = 0; i < maxIterations; i++) {
             // Stop if amount becomes too small (dust)
             if (reUSDToLoop < minLoopAmount) break;
 
-            emit LeverageIteration(i, reUSDToLoop);
-
             // a. Deposit reUSD → get sreUSD shares
-            // Note: Exchange rate is NOT 1:1, sreUSD accrues value over time
             uint256 sreUSDShares = sreUSD.deposit(reUSDToLoop, address(this));
             if (sreUSDShares == 0) break;
 
-            // b. Calculate how much crvUSD to borrow (95% LTV)
-            uint256 borrowAmount = (sreUSDShares * targetCurveLTV) / BASIS_POINTS;
+            // b. Calculate how much crvUSD to borrow based on collateral VALUE
+            // sreUSD appreciates over time, so use value not share count
+            uint256 sreUSDValue = sreUSD.convertToAssets(sreUSDShares);
+            uint256 borrowAmount = (sreUSDValue * safeCurveLTV) / BASIS_POINTS;
             if (borrowAmount == 0) break;
 
             // c. Supply sreUSD shares to Curve LLAMMA and borrow crvUSD
@@ -396,16 +405,87 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     /**
      * @notice Free funds from the strategy by deleveraging
      * @param _amount Amount of reUSD to free (excludes idle balance)
-     * @dev Uses flash loan for atomic deleverage - no iterative fallback
-     *      Flash loan approach is more capital efficient and handles large withdrawals
+     * @dev Uses flash loan for atomic deleverage. Withdrawing user pays full deleverage cost.
+     *
+     *      Loss Mechanism:
+     *      1. Sweep any existing buffer (from previous withdrawals)
+     *      2. If idle covers withdrawal, return early (no deleverage needed)
+     *      3. Snapshot totalAssets before deleverage
+     *      4. Execute flash loan deleverage (frees excess with 2x multiplier)
+     *      5. Recalculate totalAssets after deleverage
+     *      6. Actual loss = before - after (captures flash fees + slippage)
+     *      7. User pays FULL deleverage loss (they caused it, they pay it)
+     *      8. Park excess reUSD as scrvUSD to leave targetIdle = userWithdrawal - userLoss
+     *      9. TokenizedStrategy sees shortfall and passes loss to withdrawing user
      */
     function _freeFunds(uint256 _amount) internal override {
         if (_amount == 0) return;
 
-        // Require flash loan configuration
+        // Check if this is a full withdrawal (last user exiting) BEFORE any operations
+        // Must use original idle (before buffer sweep) for accurate comparison
+        uint256 originalIdle = reUSD.balanceOf(address(this));
+        uint256 vaultTotalAssets = TokenizedStrategy.totalAssets();
+        // User's expected assets = what they'd get if we free _amount
+        // This equals their share value, which TokenizedStrategy calculates as idle + _amount (shortfall)
+        // For full withdrawal: after user exits, vault should be empty
+        // Note: buffer value is NOT part of vaultTotalAssets (it's hidden as scrvUSD)
+        // So we only check: original idle + requested amount >= vault's recorded assets
+        bool isFullWithdrawal = (originalIdle + _amount >= vaultTotalAssets);
+        if (isFullWithdrawal) {
+            emit FullWithdrawal(originalIdle + _amount, vaultTotalAssets);
+        }
+
+        // 1. Sweep any existing buffer from previous withdrawals
+        // This ensures buffer value is available to current withdrawer
+        if (scrvUSDBuffer > 0) {
+            _sweepScrvUSDBuffer();
+        }
+
+        // 2. Check if idle already covers the withdrawal (after buffer sweep)
+        uint256 idlePreDeleverage = reUSD.balanceOf(address(this));
+        if (idlePreDeleverage >= _amount) {
+            return; // Idle covers withdrawal, no need to deleverage
+        }
+
+        // 3. Check if there's a position to deleverage
+        uint256 totalPreDeleverage = _calculateTotalAssets(idlePreDeleverage);
+        uint256 positionValue = totalPreDeleverage > idlePreDeleverage ? totalPreDeleverage - idlePreDeleverage : 0;
+
+        if (positionValue == 0) {
+            return; // No position to deleverage
+        }
+
+        // Require flash loan configuration for deleverage
         require(address(aavePool) != address(0), "Flash loan not configured");
 
+        // 4. Execute flash loan deleverage (frees ~2x the requested amount)
         _freeFundsWithFlashLoan(_amount);
+
+        // 5. Recalculate total assets after deleverage
+        uint256 idlePostDeleverage = reUSD.balanceOf(address(this));
+        uint256 totalPostDeleverage = _calculateTotalAssets(idlePostDeleverage);
+
+        // 6. Calculate actual loss from deleverage
+        uint256 actualLoss = totalPreDeleverage > totalPostDeleverage ? totalPreDeleverage - totalPostDeleverage : 0;
+
+        // 7. User pays the FULL loss from their deleverage
+        // They caused this deleverage, they pay its cost (swaps, flash loan premium, etc.)
+        uint256 userLoss = actualLoss;
+
+        // 8. Calculate target idle = user's full withdrawal amount - their loss
+        // userWithdrawalAmount = originalIdle (already available) + _amount (freed by deleverage)
+        uint256 userWithdrawalAmount = originalIdle + _amount;
+        uint256 targetIdle = userWithdrawalAmount > userLoss ? userWithdrawalAmount - userLoss : 0;
+
+        emit LossCalculated(totalPreDeleverage, totalPostDeleverage, actualLoss, targetIdle);
+
+        // 9. Park excess reUSD as scrvUSD to hide from idle balance
+        // This ensures TokenizedStrategy sees idle < assets and passes loss to user
+        if (idlePostDeleverage > targetIdle) {
+            uint256 excess = idlePostDeleverage - targetIdle;
+            _parkExcessAsScrvUSD(excess);
+        }
+        // Now idle ≈ targetIdle, TokenizedStrategy sees loss ≈ userLoss
     }
 
     /**
@@ -492,10 +572,10 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
     /**
      * @notice Calculate total assets: idle + collateral value - debt
-     * @param idle Current idle reUSD balance
+     * @param idleReUSD Current idle reUSD balance
      * @return Total assets in reUSD terms
      */
-    function _calculateTotalAssets(uint256 idle) internal view returns (uint256) {
+    function _calculateTotalAssets(uint256 idleReUSD) internal view returns (uint256) {
         // Get sreUSD collateral from Curve LLAMMA
         uint256 sreUSDCollateral = 0;
         if (curveLLAMMA.loan_exists(address(this))) {
@@ -514,7 +594,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         // Total = Idle + Collateral Value - Debt
-        uint256 total = idle + sreUSDValueInReUSD;
+        uint256 total = idleReUSD + sreUSDValueInReUSD;
         if (total > reUSDDebt) {
             return total - reUSDDebt;
         }
@@ -556,19 +636,6 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         return chunkSize;
-    }
-
-    /**
-     * @notice Calculate how much collateral to withdraw based on debt repaid
-     * @param debtRepaid Amount of debt repaid
-     * @return Amount of collateral to withdraw
-     */
-    function _calculateCollateralToWithdraw(uint256 debtRepaid) internal view returns (uint256) {
-        // With LTV%, for every LTV units of debt repaid, we can withdraw 1 unit of collateral
-        // collateral = debt / LTV
-        // Example: 95% LTV means for every 95 debt repaid, we free 100 collateral
-        // So collateral = debt / 0.95 = debt * (BASIS_POINTS / targetCurveLTV)
-        return (debtRepaid * BASIS_POINTS) / targetCurveLTV;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -645,19 +712,22 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Update target LTV parameters
+     * @notice Update target LTV for Resupply
      * @param _resupplyLTV New target LTV for Resupply (basis points)
-     * @param _curveLTV New target LTV for Curve LLAMMA (basis points)
      */
-    function setTargetLTVs(
-        uint256 _resupplyLTV,
-        uint256 _curveLTV
-    ) external onlyManagement {
+    function setResupplyLTV(uint256 _resupplyLTV) external onlyManagement {
         require(_resupplyLTV <= PROTOCOL_MAX_RESUPPLY_LTV, "Resupply LTV too high");
-        require(_curveLTV <= PROTOCOL_MAX_CURVE_LTV, "Curve LTV too high");
-
         targetResupplyLTV = _resupplyLTV;
-        targetCurveLTV = _curveLTV;
+    }
+
+    /**
+     * @notice Update Curve LTV buffer (distance below max LTV)
+     * @param _buffer Buffer in basis points (e.g., 600 = 6%)
+     * @dev Curve safe LTV = 100% - loan_discount - buffer
+     */
+    function setCurveLTVBuffer(uint256 _buffer) external onlyManagement {
+        require(_buffer <= 2000, "Buffer too high"); // Max 20% buffer
+        curveLTVBuffer = _buffer;
     }
 
     /**
@@ -841,6 +911,54 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         usdc.safeApprove(_crvUSDUSDCPool, type(uint256).max);
         // Approve crvUSD for swap pool
         crvUSD.safeApprove(_crvUSDUSDCPool, type(uint256).max);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    SCRVUSD BUFFER MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Park excess reUSD as scrvUSD to hide it from idle balance
+     * @param _reUSDAmount Amount of reUSD to convert to scrvUSD buffer
+     * @dev Converts reUSD → scrvUSD via Curve pool (single swap)
+     *      Using scrvUSD instead of crvUSD: fewer swaps + earns yield while parked
+     */
+    function _parkExcessAsScrvUSD(uint256 _reUSDAmount) internal {
+        if (_reUSDAmount == 0 || address(scrvUSDReUSDPool) == address(0)) return;
+
+        // reUSD → scrvUSD via pool (index 0 → 1)
+        uint256 scrvUSDReceived = scrvUSDReUSDPool.exchange(0, 1, _reUSDAmount, 0);
+        if (scrvUSDReceived == 0) return;
+
+        // Track buffer (scrvUSD earns yield while parked)
+        scrvUSDBuffer += scrvUSDReceived;
+
+        emit BufferParked(_reUSDAmount, scrvUSDReceived);
+    }
+
+    /**
+     * @notice Sweep scrvUSD buffer back to reUSD
+     * @dev Converts scrvUSD → reUSD via Curve pool (single swap)
+     *      Called at start of _deployFunds and _freeFunds to recover parked funds
+     */
+    function _sweepScrvUSDBuffer() internal {
+        if (scrvUSDBuffer == 0 || address(scrvUSDReUSDPool) == address(0)) return;
+
+        uint256 bufferAmount = scrvUSDBuffer;
+        scrvUSDBuffer = 0; // Clear buffer before conversion
+
+        // scrvUSD → reUSD via pool (index 1 → 0)
+        uint256 reUSDReceived = scrvUSDReUSDPool.exchange(1, 0, bufferAmount, 0);
+
+        emit BufferSwept(bufferAmount, reUSDReceived);
+    }
+
+    /**
+     * @notice Get current scrvUSD buffer amount
+     * @return Amount of scrvUSD parked in buffer
+     */
+    function getScrvUSDBuffer() external view returns (uint256) {
+        return scrvUSDBuffer;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1065,14 +1183,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Calculate position value (total assets minus idle)
         uint256 positionValue = freshTotalAssets > currentIdle ? freshTotalAssets - currentIdle : 0;
 
-        // Check if this is a full withdrawal (last user exiting) BEFORE early return
+        // Check if this is a full withdrawal (last user exiting)
+        // Note: FullWithdrawal event is emitted in _freeFunds() to handle all cases
         uint256 userReceives = currentIdle + _amount;
         uint256 vaultTotalAssets = TokenizedStrategy.totalAssets();
         bool isFullWithdrawal = (userReceives >= vaultTotalAssets);
-
-        if (isFullWithdrawal) {
-            emit FullWithdrawal(userReceives, vaultTotalAssets);
-        }
 
         if (positionValue == 0) return; // No position to unwind (idle covers withdrawal)
 
@@ -1166,8 +1281,9 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             if (curveDebtRemaining > 0) {
                 // Still have debt - can only withdraw excess above safe LTV
                 uint256 sreUSDCollateralValue = sreUSD.convertToAssets(sreUSDCollateral);
-                uint256 safeCurveLTV = 9000; // 90% safe LTV
+                uint256 safeCurveLTV = 9400; // 94% safe LTV (1% buffer below 95% target)
                 uint256 minCollateralValue = (curveDebtRemaining * BASIS_POINTS) / safeCurveLTV;
+
                 if (sreUSDCollateralValue > minCollateralValue) {
                     withdrawableSreUSD = sreUSD.convertToShares(sreUSDCollateralValue - minCollateralValue);
                 } else {
