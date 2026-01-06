@@ -78,6 +78,7 @@ contract LoopStrategyForkTest is Test {
     // Flash loan configuration
     address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address public constant AAVE_V3_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
+    address public constant CRVUSD_FLASH_LENDER = 0x26dE7861e213A5351F6ED767d00e0839930e9eE1;
     address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     // Curve crvUSD/USDC pool (llamma)
     address public constant CRVUSD_USDC_POOL = 0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E;
@@ -121,9 +122,12 @@ contract LoopStrategyForkTest is Test {
 
         loopStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
 
-        // Configure flash loan for deleverage (Balancer V2 default - 0% fee, Aave fallback - 0.05% fee)
+        // Configure flash loan for deleverage
+        // - crvUSD FlashLender (0% fee, no swap overhead - preferred for amounts <= ~1M)
+        // - Balancer V2 (0% fee - USDC fallback for larger amounts)
+        // - Aave (0.05% fee - last resort)
         // In pool 0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E: USDC = index 0, crvUSD = index 1
-        loopStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, USDC, CRVUSD_USDC_POOL, 1, 0);
+        loopStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, CRVUSD_FLASH_LENDER, USDC, CRVUSD_USDC_POOL, 1, 0);
 
         deal(REUSD, user, 20000 ether, true);
 
@@ -1348,17 +1352,31 @@ contract LoopStrategyForkTest is Test {
     }
 
     function testFork_AaveVsBalancer_FeeDifference() public {
+        // Deploy fresh strategy WITHOUT crvUSD FlashLender to force USDC flash loan path
+        // This allows us to compare Balancer (0% fee) vs Aave (0.05% fee)
+        SreUSDCrvUSDLoopStrategy balancerStrategy = new SreUSDCrvUSDLoopStrategy(
+            REUSD, SREUSD, CRVUSD, CURVE_LLAMMA, RESUPPLY_PAIR, "Balancer Test Strategy"
+        );
+        IStrategy balancerVault = IStrategy(address(balancerStrategy));
+        balancerVault.setKeeper(keeper);
+        balancerVault.setPendingManagement(management);
+        vm.prank(management);
+        balancerVault.acceptManagement();
+        balancerStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
+        // No crvUSD FlashLender - forces USDC flash loan path
+        balancerStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, address(0), USDC, CRVUSD_USDC_POOL, 1, 0);
+
         // Test 1: Withdraw with Balancer (default, 0% fee)
         vm.startPrank(user);
-        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
-        strategyVault.deposit(INITIAL_DEPOSIT, user);
+        IERC20(REUSD).approve(address(balancerStrategy), INITIAL_DEPOSIT);
+        balancerVault.deposit(INITIAL_DEPOSIT, user);
         vm.stopPrank();
 
-        uint256 shares = strategyVault.balanceOf(user);
+        uint256 shares = balancerVault.balanceOf(user);
         vm.prank(user);
-        uint256 balancerReceived = strategyVault.redeem(shares, user, user);
+        uint256 balancerReceived = balancerVault.redeem(shares, user, user);
 
-        emit log("=== Balancer vs Aave Fee Comparison ===");
+        emit log("=== Balancer vs Aave Fee Comparison (USDC flash loans) ===");
         emit log_named_decimal_uint("Balancer received", balancerReceived, 18);
 
         // Test 2: Deploy new strategy and use Aave
@@ -1372,7 +1390,8 @@ contract LoopStrategyForkTest is Test {
         vm.prank(management);
         aaveVault.acceptManagement();
         aaveStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
-        aaveStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, USDC, CRVUSD_USDC_POOL, 1, 0);
+        // No crvUSD FlashLender - forces USDC flash loan path
+        aaveStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, address(0), USDC, CRVUSD_USDC_POOL, 1, 0);
         aaveStrategy.setFlashLoanProvider(SreUSDCrvUSDLoopStrategy.FlashLoanProvider.AAVE);
 
         // Give user more tokens for second test
