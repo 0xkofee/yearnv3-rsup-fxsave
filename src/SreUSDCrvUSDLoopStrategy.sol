@@ -119,7 +119,17 @@ interface IUniswapV3Router {
     function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
 
-// Aave V3 Pool Interface for Flash Loans
+// Balancer V2 Vault Interface for Flash Loans (0% fee)
+interface IBalancerVault {
+    function flashLoan(
+        address recipient,
+        address[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+// Aave V3 Pool Interface for Flash Loans (0.05% fee - fallback)
 interface IAavePool {
     function flashLoanSimple(
         address receiverAddress,
@@ -128,17 +138,6 @@ interface IAavePool {
         bytes calldata params,
         uint16 referralCode
     ) external;
-}
-
-// Aave V3 Flash Loan Receiver Interface
-interface IFlashLoanSimpleReceiver {
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 premium,
-        address initiator,
-        bytes calldata params
-    ) external returns (bool);
 }
 
 // Curve crvUSD/USDC Pool Interface (StableSwap uses int128 indices)
@@ -276,7 +275,10 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     // sreUSD/reUSD pool is used for sreUSD → reUSD conversion in callback
 
     // Flash loan deleverage configuration
-    IAavePool public aavePool;                          // Aave V3 Pool for flash loans
+    enum FlashLoanProvider { BALANCER, AAVE }
+    FlashLoanProvider public flashLoanProvider;         // Default: BALANCER (0) - 0% fee
+    IBalancerVault public balancerVault;                // Balancer V2 Vault for flash loans (0% fee)
+    IAavePool public aavePool;                          // Aave V3 Pool for flash loans (0.05% fee - fallback)
     ERC20 public usdc;                                  // USDC token for flash loans
     ICrvUSDPool public crvUSDUSDCPool;                  // Curve pool for USDC <-> crvUSD swaps
     int128 public crvUSDIndexInPool;                    // Index of crvUSD in the swap pool (0)
@@ -456,7 +458,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         // Require flash loan configuration for deleverage
-        require(address(aavePool) != address(0), "Flash loan not configured");
+        if (flashLoanProvider == FlashLoanProvider.BALANCER) {
+            require(address(balancerVault) != address(0), "Balancer not configured");
+        } else {
+            require(address(aavePool) != address(0), "Aave not configured");
+        }
 
         // 4. Execute flash loan deleverage (frees ~2x the requested amount)
         _freeFundsWithFlashLoan(_amount);
@@ -883,34 +889,57 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
     /**
      * @notice Configure flash loan parameters for deleverage
-     * @param _aavePool Aave V3 Pool address for flash loans
+     * @param _balancerVault Balancer V2 Vault address for flash loans (0% fee), or address(0) to skip
+     * @param _aavePool Aave V3 Pool address for flash loans (0.05% fee - fallback), or address(0) to skip
      * @param _usdc USDC token address
      * @param _crvUSDUSDCPool Curve pool for USDC <-> crvUSD swaps
      * @param _crvUSDIndex Index of crvUSD in the pool
      * @param _usdcIndex Index of USDC in the pool
      */
     function setFlashLoanConfig(
+        address _balancerVault,
         address _aavePool,
         address _usdc,
         address _crvUSDUSDCPool,
         int128 _crvUSDIndex,
         int128 _usdcIndex
     ) external onlyManagement {
-        require(_aavePool != address(0), "Invalid Aave pool");
+        require(_balancerVault != address(0) || _aavePool != address(0), "No flash loan provider");
         require(_usdc != address(0), "Invalid USDC");
         require(_crvUSDUSDCPool != address(0), "Invalid swap pool");
 
-        aavePool = IAavePool(_aavePool);
+        if (_balancerVault != address(0)) {
+            balancerVault = IBalancerVault(_balancerVault);
+        }
+        if (_aavePool != address(0)) {
+            aavePool = IAavePool(_aavePool);
+        }
         usdc = ERC20(_usdc);
         crvUSDUSDCPool = ICrvUSDPool(_crvUSDUSDCPool);
         crvUSDIndexInPool = _crvUSDIndex;
         usdcIndexInPool = _usdcIndex;
 
-        // Approve USDC for Aave repayment and swap pool
-        usdc.safeApprove(_aavePool, type(uint256).max);
+        // Approve USDC for swap pool
         usdc.safeApprove(_crvUSDUSDCPool, type(uint256).max);
+        // Approve USDC for Aave repayment (Aave pulls via transferFrom)
+        if (_aavePool != address(0)) {
+            usdc.safeApprove(_aavePool, type(uint256).max);
+        }
         // Approve crvUSD for swap pool
         crvUSD.safeApprove(_crvUSDUSDCPool, type(uint256).max);
+    }
+
+    /**
+     * @notice Set the flash loan provider
+     * @param _provider The provider to use (0 = Balancer, 1 = Aave)
+     */
+    function setFlashLoanProvider(FlashLoanProvider _provider) external onlyManagement {
+        if (_provider == FlashLoanProvider.BALANCER) {
+            require(address(balancerVault) != address(0), "Balancer not configured");
+        } else {
+            require(address(aavePool) != address(0), "Aave not configured");
+        }
+        flashLoanProvider = _provider;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1167,14 +1196,14 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     /**
      * @notice Free funds using flash loan for atomic deleverage
      * @param _amount Amount of reUSD to free from the leveraged position
-     * @dev Uses Aave V3 flash loan to atomically close positions:
+     * @dev Uses configured flash loan provider to atomically close positions:
      *      1. Flash loan USDC
      *      2. Swap USDC → crvUSD
      *      3. Repay Curve debt → unlock sreUSD
      *      4. Redeem sreUSD → reUSD
      *      5. Repay Resupply debt → unlock crvUSD
      *      6. Swap crvUSD → USDC
-     *      7. Repay flash loan + fee
+     *      7. Repay flash loan
      */
     function _freeFundsWithFlashLoan(uint256 _amount) internal {
         uint256 currentIdle = reUSD.balanceOf(address(this));
@@ -1210,31 +1239,56 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         uint256 curveDebtForFlash = curveLLAMMA.loan_exists(address(this)) ? curveLLAMMA.debt(address(this)) : 0;
         uint256 crvUSDNeeded = (curveDebtForFlash * fractionBps) / BASIS_POINTS;
 
-        // Flash the exact amount needed (no buffer - shortfall covered by reUSD equity)
-        // Buffer is counterproductive: more flash = more premium owed
+        // Flash the exact amount needed
         uint256 usdcToFlash = crvUSDNeeded / 1e12; // Convert 18 decimals to 6
         if (usdcToFlash == 0) return;
 
         // Encode params for callback
-        bytes memory params = abi.encode(fractionBps);
+        bytes memory userData = abi.encode(fractionBps);
 
-        // Initiate flash loan - callback will handle the deleverage
-        aavePool.flashLoanSimple(
-            address(this),  // receiver
-            address(usdc),  // asset
-            usdcToFlash,    // amount
-            params,         // params passed to callback
-            0               // referralCode
-        );
+        // Initiate flash loan based on configured provider
+        if (flashLoanProvider == FlashLoanProvider.BALANCER) {
+            address[] memory tokens = new address[](1);
+            tokens[0] = address(usdc);
+            uint256[] memory amounts = new uint256[](1);
+            amounts[0] = usdcToFlash;
+            balancerVault.flashLoan(address(this), tokens, amounts, userData);
+        } else {
+            aavePool.flashLoanSimple(address(this), address(usdc), usdcToFlash, userData, 0);
+        }
     }
 
     /**
-     * @notice Aave V3 flash loan callback - executes the atomic deleverage
+     * @notice Balancer V2 flash loan callback
+     * @param tokens Array of flash loaned tokens (just USDC)
+     * @param amounts Array of flash loaned amounts
+     * @param feeAmounts Array of fees (0 for Balancer)
+     * @param userData Encoded fractionBps
+     */
+    function receiveFlashLoan(
+        address[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external {
+        require(msg.sender == address(balancerVault), "Only Balancer vault");
+        require(tokens.length == 1 && tokens[0] == address(usdc), "Wrong token");
+
+        uint256 fractionBps = abi.decode(userData, (uint256));
+        _executeFlashLoanDeleverage(amounts[0], feeAmounts[0], fractionBps);
+
+        // Repay by transferring USDC back to Balancer vault
+        uint256 amountOwed = amounts[0] + feeAmounts[0];
+        usdc.safeTransfer(address(balancerVault), amountOwed);
+    }
+
+    /**
+     * @notice Aave V3 flash loan callback
      * @param asset The flash loaned asset (USDC)
      * @param amount The flash loaned amount
-     * @param premium The flash loan fee
+     * @param premium The flash loan fee (0.05%)
      * @param initiator Who initiated the flash loan
-     * @param params Encoded (fractionBps, currentIdle, userReceives)
+     * @param params Encoded fractionBps
      * @return True if successful
      */
     function executeOperation(
@@ -1249,8 +1303,23 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         require(asset == address(usdc), "Wrong asset");
 
         uint256 fractionBps = abi.decode(params, (uint256));
+        _executeFlashLoanDeleverage(amount, premium, fractionBps);
 
+        // Aave pulls repayment via transferFrom (approval already set)
+        return true;
+    }
 
+    /**
+     * @notice Shared flash loan deleverage execution
+     * @param amount Flash loaned USDC amount
+     * @param fee Flash loan fee (0 for Balancer, 0.05% for Aave)
+     * @param fractionBps Fraction of position to close (in basis points)
+     */
+    function _executeFlashLoanDeleverage(
+        uint256 amount,
+        uint256 fee,
+        uint256 fractionBps
+    ) internal {
         // Step 1: Swap USDC → crvUSD
         uint256 crvUSDReceived = crvUSDUSDCPool.exchange(
             usdcIndexInPool,
@@ -1343,7 +1412,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         // Step 7: Swap crvUSD → USDC to repay flash loan
         uint256 crvUSDBalance = crvUSD.balanceOf(address(this));
-        uint256 amountOwed = amount + premium;
+        uint256 amountOwed = amount + fee;
 
         if (crvUSDBalance > 0) {
             // Swap crvUSD to USDC
@@ -1356,8 +1425,6 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         // Step 8: Cover any USDC shortfall using leftover reUSD equity
-        // After repaying Resupply debt, leftover reUSD = user's original deposit
-        // We convert just enough to cover flash fee + swap slippage (~0.21%)
         uint256 usdcBalance = usdc.balanceOf(address(this));
         if (usdcBalance < amountOwed && address(scrvUSDReUSDPool) != address(0)) {
             uint256 shortfall = amountOwed - usdcBalance;
@@ -1381,10 +1448,5 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Verify we can repay the flash loan
         usdcBalance = usdc.balanceOf(address(this));
         require(usdcBalance >= amountOwed, "Insufficient USDC for repayment");
-
-        // Note: USDC approval for Aave already set to max in setFlashLoanConfig
-
-
-        return true;
     }
 }

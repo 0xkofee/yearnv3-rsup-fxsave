@@ -76,6 +76,7 @@ contract LoopStrategyForkTest is Test {
     address public constant SCRVUSD_REUSD_POOL = 0xc522A6606BBA746d7960404F22a3DB936B6F4F50;
 
     // Flash loan configuration
+    address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address public constant AAVE_V3_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
     address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     // Curve crvUSD/USDC pool (llamma)
@@ -120,9 +121,9 @@ contract LoopStrategyForkTest is Test {
 
         loopStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
 
-        // Configure flash loan for deleverage
+        // Configure flash loan for deleverage (Balancer V2 default - 0% fee, Aave fallback - 0.05% fee)
         // In pool 0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E: USDC = index 0, crvUSD = index 1
-        loopStrategy.setFlashLoanConfig(AAVE_V3_POOL, USDC, CRVUSD_USDC_POOL, 1, 0);
+        loopStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, USDC, CRVUSD_USDC_POOL, 1, 0);
 
         deal(REUSD, user, 20000 ether, true);
 
@@ -1251,6 +1252,152 @@ contract LoopStrategyForkTest is Test {
 
         // User2 should receive at least 98% of preview (their own deleverage cost only)
         assertGe(received2, preview2 * 98 / 100, "User2 should receive >= 98% of preview");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    FLASH LOAN PROVIDER TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function testFork_ProviderSwitching() public {
+        // Verify default is Balancer (enum value 0)
+        assertEq(
+            uint256(loopStrategy.flashLoanProvider()),
+            0,
+            "Default should be Balancer"
+        );
+
+        // Switch to Aave
+        loopStrategy.setFlashLoanProvider(
+            SreUSDCrvUSDLoopStrategy.FlashLoanProvider.AAVE
+        );
+        assertEq(
+            uint256(loopStrategy.flashLoanProvider()),
+            1,
+            "Should be Aave after switch"
+        );
+
+        // Switch back to Balancer
+        loopStrategy.setFlashLoanProvider(
+            SreUSDCrvUSDLoopStrategy.FlashLoanProvider.BALANCER
+        );
+        assertEq(
+            uint256(loopStrategy.flashLoanProvider()),
+            0,
+            "Should be Balancer after switch back"
+        );
+    }
+
+    function testFork_FullWithdrawal_Aave() public {
+        // Switch to Aave flash loan provider
+        loopStrategy.setFlashLoanProvider(
+            SreUSDCrvUSDLoopStrategy.FlashLoanProvider.AAVE
+        );
+
+        // Deposit
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        emit log("=== Aave Full Withdrawal Test ===");
+
+        // Withdraw all shares
+        uint256 shares = strategyVault.balanceOf(user);
+        vm.prank(user);
+        uint256 received = strategyVault.redeem(shares, user, user);
+
+        emit log_named_decimal_uint("Deposited", INITIAL_DEPOSIT, 18);
+        emit log_named_decimal_uint("Received", received, 18);
+        emit log_named_decimal_uint("Loss", INITIAL_DEPOSIT - received, 18);
+
+        // Aave has 0.05% fee on flash loan amount (~190k for 10k withdrawal)
+        // Expected extra loss: ~$95 compared to Balancer
+        // Total loss should be < 3% (slippage + Aave fee)
+        assertGe(received, 9_700e18, "Should receive at least 97%");
+        assertLe(received, INITIAL_DEPOSIT, "Should not receive more than deposit");
+    }
+
+    function testFork_PartialWithdrawal_Aave() public {
+        // Switch to Aave flash loan provider
+        loopStrategy.setFlashLoanProvider(
+            SreUSDCrvUSDLoopStrategy.FlashLoanProvider.AAVE
+        );
+
+        // Deposit
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        emit log("=== Aave Partial Withdrawal Test ===");
+
+        // Withdraw 50%
+        uint256 shares = strategyVault.balanceOf(user);
+        uint256 withdrawShares = shares / 2;
+        uint256 expectedAmount = INITIAL_DEPOSIT / 2;
+
+        vm.prank(user);
+        uint256 received = strategyVault.redeem(withdrawShares, user, user);
+
+        emit log_named_decimal_uint("Expected", expectedAmount, 18);
+        emit log_named_decimal_uint("Received", received, 18);
+
+        // Should receive at least 95% of expected (partial withdrawal has higher slippage)
+        assertGe(received, expectedAmount * 95 / 100, "Should receive at least 95%");
+        assertLe(received, expectedAmount, "Should not receive more than expected");
+    }
+
+    function testFork_AaveVsBalancer_FeeDifference() public {
+        // Test 1: Withdraw with Balancer (default, 0% fee)
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(loopStrategy), INITIAL_DEPOSIT);
+        strategyVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        uint256 shares = strategyVault.balanceOf(user);
+        vm.prank(user);
+        uint256 balancerReceived = strategyVault.redeem(shares, user, user);
+
+        emit log("=== Balancer vs Aave Fee Comparison ===");
+        emit log_named_decimal_uint("Balancer received", balancerReceived, 18);
+
+        // Test 2: Deploy new strategy and use Aave
+        // Need fresh strategy since we fully withdrew
+        SreUSDCrvUSDLoopStrategy aaveStrategy = new SreUSDCrvUSDLoopStrategy(
+            REUSD, SREUSD, CRVUSD, CURVE_LLAMMA, RESUPPLY_PAIR, "Aave Test Strategy"
+        );
+        IStrategy aaveVault = IStrategy(address(aaveStrategy));
+        aaveVault.setKeeper(keeper);
+        aaveVault.setPendingManagement(management);
+        vm.prank(management);
+        aaveVault.acceptManagement();
+        aaveStrategy.setRewardSwapPool(SCRVUSD, SCRVUSD_REUSD_POOL);
+        aaveStrategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, USDC, CRVUSD_USDC_POOL, 1, 0);
+        aaveStrategy.setFlashLoanProvider(SreUSDCrvUSDLoopStrategy.FlashLoanProvider.AAVE);
+
+        // Give user more tokens for second test
+        deal(REUSD, user, INITIAL_DEPOSIT, true);
+
+        vm.startPrank(user);
+        IERC20(REUSD).approve(address(aaveStrategy), INITIAL_DEPOSIT);
+        aaveVault.deposit(INITIAL_DEPOSIT, user);
+        vm.stopPrank();
+
+        shares = aaveVault.balanceOf(user);
+        vm.prank(user);
+        uint256 aaveReceived = aaveVault.redeem(shares, user, user);
+
+        emit log_named_decimal_uint("Aave received", aaveReceived, 18);
+        emit log_named_decimal_uint("Difference (Aave fee cost)", balancerReceived - aaveReceived, 18);
+
+        // Aave should return less due to 0.05% fee
+        assertLt(aaveReceived, balancerReceived, "Aave should return less due to fee");
+
+        // The difference should be the Aave 0.05% fee on flash loan amount
+        // Flash loan ~54k USDC, so fee ≈ 0.05% * 54k ≈ $27
+        uint256 feeDiff = balancerReceived - aaveReceived;
+        assertGt(feeDiff, 10e18, "Fee difference should be > $10");
+        assertLt(feeDiff, 100e18, "Fee difference should be < $100");
     }
 
     /*//////////////////////////////////////////////////////////////
