@@ -241,6 +241,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     uint256 public targetResupplyLTV;   // Target: 9200 (92%)
     // Curve LTV is calculated dynamically: (100% - loan_discount - curveLTVBuffer)
     uint256 public curveLTVBuffer;      // Buffer below max LTV (default: 600 = 6%)
+    uint256 public curveLoanBands;      // Number of bands for Curve loans (default: 5)
 
     // Protocol maximum LTVs (used to validate setter inputs)
     uint256 public constant PROTOCOL_MAX_RESUPPLY_LTV = 9500;  // 95% - Resupply protocol max
@@ -333,6 +334,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set default target LTVs
         targetResupplyLTV = 9200;  // 92% for Resupply
         curveLTVBuffer = 600;      // 6% buffer below Curve's max (accounts for bands + safety)
+        curveLoanBands = 5;        // 5 bands for Curve loans
 
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
@@ -634,8 +636,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             // Add to existing loan
             curveLLAMMA.borrow_more(collateral, debt);
         } else {
-            // Create new loan with 10 bands (appropriate for stable collateral)
-            curveLLAMMA.create_loan(collateral, debt, 10);
+            // Create new loan with configured number of bands
+            curveLLAMMA.create_loan(collateral, debt, curveLoanBands);
         }
     }
 
@@ -747,6 +749,15 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     function setCurveLTVBuffer(uint256 _buffer) external onlyManagement {
         require(_buffer <= 2000, "Buffer too high"); // Max 20% buffer
         curveLTVBuffer = _buffer;
+    }
+
+    /**
+     * @notice Set number of bands for Curve loans
+     * @param _bands Number of bands (4-50 typically)
+     */
+    function setCurveLoanBands(uint256 _bands) external onlyManagement {
+        require(_bands >= 4 && _bands <= 50, "Invalid bands");
+        curveLoanBands = _bands;
     }
 
     /**
@@ -1247,9 +1258,11 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             // Base fraction = amount to free / position value
             uint256 baseFraction = (_amount * BASIS_POINTS) / positionValue;
 
-            // For partial withdrawals from leveraged positions, extraction efficiency is ~50%
-            // because freed collateral mostly goes to debt repayment, not user.
-            // 2x multiplier compensates: close 2x more position to get correct equity.
+            // 2x multiplier needed due to Curve's LTV constraint on partial withdrawals.
+            // When you repay X% of Curve debt, you can only withdraw ~(X-3)% of collateral
+            // because remaining debt still requires minimum collateral at safe LTV.
+            // This ~3% gap compounds to ~8% shortfall. 2x ensures we always free enough.
+            // Excess is parked as scrvUSD buffer and recovered on next operation.
             fractionBps = baseFraction * 2;
             if (fractionBps > BASIS_POINTS) fractionBps = BASIS_POINTS;
         }

@@ -271,158 +271,339 @@ Loop with borrowed reUSD...
 
 ## Partial Withdrawal Math: Why We Use a 2x Multiplier
 
-When a user makes a partial withdrawal from a leveraged position, the naive approach of closing a proportional fraction of the position doesn't work. Here's a complete walkthrough with real numbers.
+When a user makes a partial withdrawal from a leveraged position, the naive approach of closing a proportional fraction doesn't work due to **LTV constraints**. Here's a complete walkthrough.
 
 ### Step 1: Building the Leveraged Position
 
-User deposits **10,000 reUSD**. The strategy loops to build leverage:
+User deposits **100 reUSD**. The strategy loops to build leverage:
 
 ```
 Iteration 1:
-  - Convert 10,000 reUSD → 10,000 sreUSD (deposit to vault)
-  - Deposit sreUSD to Curve LLAMMA as collateral
-  - Borrow 9,500 crvUSD at 95% LTV
-  - Deposit crvUSD to Resupply as collateral
-  - Borrow 8,740 reUSD at 92% LTV
+  - 100 reUSD → 100 sreUSD (deposit to sreUSD vault)
+  - Deposit 100 sreUSD to Curve LLAMMA as collateral
+  - Borrow 95 crvUSD at 95% LTV
+  - Deposit 95 crvUSD to Resupply as collateral
+  - Borrow 87.4 reUSD at 92% LTV
 
 Iteration 2:
-  - Convert 8,740 reUSD → sreUSD → deposit → borrow 8,303 crvUSD
-  - Deposit to Resupply → borrow 7,639 reUSD
+  - 87.4 reUSD → 87.4 sreUSD
+  - Add to Curve (total: 187.4 sreUSD), borrow more → total debt: 178 crvUSD
+  - Add to Resupply (total: 178 crvUSD), borrow more → total debt: 163.8 reUSD
 
-Iteration 3-14: Continue until amounts become negligible
+Iterations 3-14: Continue until amounts < minLoopAmount
 ```
 
-**Final Position State:**
+**Final Position (after ~14 loops):**
 ```
 Curve LLAMMA:
-  - Collateral: 53,274 sreUSD shares (worth ~61,000 crvUSD with appreciation)
-  - Debt: 50,611 crvUSD
+  - Collateral: 769 sreUSD (worth 769 reUSD)
+  - Debt: 730 crvUSD
+  - LTV: 730/769 = 95%
 
 Resupply:
-  - Collateral: ~50,600 crvUSD
-  - Debt: 45,592 reUSD
+  - Collateral: 730 crvUSD
+  - Debt: 672 reUSD
+  - LTV: 672/730 = 92%
 
-Strategy Balance:
-  - Position value: 10,000 reUSD (all deployed, no idle buffer)
-  - Total assets: 10,000 reUSD (user's equity)
+User Equity: 769 - 672 = 97 reUSD (~3% loss to rounding across loops)
 ```
 
-### Step 2: User Requests 25% Withdrawal
+### Step 2: User Requests 50% Withdrawal
 
-User wants to redeem 2,500 shares (25% of their 10,000 deposit).
-
-```
-Total withdrawal needed: 2,500 reUSD
-Amount to free from position (_amount): 2,500 reUSD
-```
-
-### Step 3: Naive Approach (Without 2x Multiplier)
-
-Calculate fraction of position to close:
-```
-baseFraction = _amount / positionValue
-             = 2,500 / 10,000
-             = 25%
-```
-
-With naive 25% fraction: `fractionBps = 2,500` (25%)
-
-**Flash Loan Execution:**
+User wants to withdraw **50 reUSD** (≈50% of their 97 reUSD equity).
 
 ```
-Step 1: Flash 12,653 USDC, swap to crvUSD
-        (25% of 50,611 crvUSD debt)
+baseFraction = 50 / 97 = 51.5%
+```
+
+### Step 3: Naive Approach (No Multiplier)
+
+With `fractionBps = 51.5%`:
+
+```
+Step 1: Flash loan 376 crvUSD (51.5% of 730 debt)
 
 Step 2: Repay Curve debt
-        - Debt before: 50,611 crvUSD
-        - Repay: 12,653 crvUSD
-        - Debt after: 37,958 crvUSD
+        - Repay: 376 crvUSD
+        - Remaining debt: 354 crvUSD
 
-Step 3: Withdraw sreUSD from Curve
-        - Total collateral: 53,274 sreUSD (worth 61,000 crvUSD)
-        - Remaining debt: 37,958 crvUSD
-        - At 90% safe LTV, minimum collateral: 37,958 / 0.9 = 42,175 crvUSD
-        - Withdrawable: 61,000 - 42,175 = 18,825 crvUSD worth
-        - Actually withdrawn: 10,379 sreUSD shares
+Step 3: Withdraw sreUSD from Curve ← HERE'S THE PROBLEM
+        - Total collateral: 769 sreUSD
+        - Remaining debt: 354 crvUSD
+        - At 94% safe LTV, min collateral required: 354 / 0.94 = 377 sreUSD
+        - Withdrawable: 769 - 377 = 392 sreUSD
+        - Expected (proportional): 51.5% × 769 = 396 sreUSD
+        - SHORTFALL: 4 sreUSD (can't withdraw proportionally!)
 
 Step 4: Redeem sreUSD → reUSD
-        - 10,379 sreUSD → 11,936 reUSD
+        - 392 sreUSD → 392 reUSD
 
-Step 5: Repay Resupply debt (proportional)
-        - Total debt: 45,592 reUSD
-        - Repay 25%: 11,398 reUSD
-        - Remaining reUSD: 11,936 - 11,398 = 538 reUSD  ← USER GETS THIS
+Step 5: Repay Resupply debt (proportional to fractionBps)
+        - Repay: 51.5% × 672 = 346 reUSD
+        - Remaining reUSD: 392 - 346 = 46 reUSD ← USER GETS THIS
 
-Step 6-8: Withdraw crvUSD, swap to USDC, repay flash loan
+Step 6: Withdraw crvUSD from Resupply
+        - Remaining debt: 326 reUSD
+        - Collateral: 730 crvUSD
+        - At 92% safe LTV, min collateral: 326 / 0.92 = 354 crvUSD
+        - Withdrawable: 730 - 354 = 376 crvUSD
+
+Step 7: Repay flash loan
+        - Owe: 376 crvUSD
+        - Have: 376 crvUSD ✓
 ```
 
 **Result:**
 ```
-User receives: 538 reUSD (freed from position)
-User expected: 2,500 reUSD
-Shortfall: 1,962 reUSD (78.5% loss!)
+User receives: 46 reUSD
+User expected: 50 reUSD
+Shortfall: 4 reUSD (8% loss!)
 ```
 
 ### Step 4: Why The Loss Occurs
 
-The freed collateral (11,936 reUSD from sreUSD redemption) is almost entirely consumed by Resupply debt repayment (11,398 reUSD). Only the **remainder** goes to the user.
+The loss comes from **Step 3: Curve's LTV constraint**.
+
+When you repay X% of Curve debt, you **cannot** withdraw X% of collateral. You can only withdraw the **excess above minimum collateral** required for the remaining debt:
 
 ```
-Extraction Efficiency = Received / Expected
-                      = 538 / 2,500
-                      = 21.5% (from position)
+withdrawable = totalCollateral - (remainingDebt / safeLTV)
 ```
 
-The fundamental issue: **In a leveraged position, freeing collateral also requires repaying debt. The user only receives the net difference.**
+At 95% LTV with 94% safe LTV:
+- Repay 51.5% of debt → 48.5% remains
+- Min collateral for remaining = 48.5% × debt / 0.94 = 51.6% of original
+- Can only withdraw: 100% - 51.6% = 48.4% (not 51.5%!)
+
+The ~3% gap between what we repaid (51.5%) and what we can withdraw (48.4%) means we get less sreUSD → less reUSD → shortfall after Resupply repayment.
 
 ### Step 5: The 2x Multiplier Solution
 
-To compensate for the low extraction efficiency from the position, we close 2x more:
+By closing **2x** the proportional fraction, we ensure enough collateral is freed:
 
 ```solidity
 fractionBps = baseFraction * 2;
 ```
 
-**With 2x Multiplier:**
+**With 2x Multiplier (fractionBps = 100%):**
+
 ```
-baseFraction = 2,500 / 10,000 = 2,500 bps (25%)
-fractionBps = 2,500 * 2 = 5,000 bps (50%)
+Step 1: Flash loan 730 crvUSD (100% of debt)
+
+Step 2: Repay ALL Curve debt
+        - Remaining debt: 0 crvUSD
+
+Step 3: Withdraw sreUSD from Curve
+        - No LTV constraint (debt = 0)!
+        - Withdraw ALL 769 sreUSD ✓
+
+Step 4: Redeem sreUSD → reUSD
+        - 769 sreUSD → 769 reUSD
+
+Step 5: Repay Resupply debt (capped at 100%)
+        - Repay: 672 reUSD
+        - Remaining reUSD: 769 - 672 = 97 reUSD
+
+Step 6: Withdraw crvUSD from Resupply
+        - No debt remaining → withdraw ALL 730 crvUSD
+
+Step 7: Repay flash loan
+        - Owe: 730 crvUSD
+        - Have: 730 crvUSD ✓
 ```
 
-Now the flash loan execution closes 50% of the position instead of 25%. After debt repayment, the user receives approximately the correct amount.
+**Result:**
+```
+User receives: 97 reUSD (entire equity freed)
+User wanted: 50 reUSD
+Excess: 47 reUSD → parked as scrvUSD buffer for next user
+```
 
-**Result with 2x:**
-```
-User receives: ~2,500 reUSD ✓
-Slippage: < 1%
-```
+The 2x multiplier overshoots, but the excess is parked and recovered on the next deposit/withdrawal.
 
 ### Why 2x Specifically?
 
-The 2x multiplier was determined empirically through testing. The theoretical math for simple leveraged positions doesn't directly apply here because:
+The shortfall percentage depends on how close current LTV is to safe LTV:
 
-1. **Two-layer structure**: Curve (sreUSD→crvUSD) + Resupply (crvUSD→reUSD)
-2. **Flash loan flow**: Repaying debt first frees collateral, changing the dynamics
-3. **Cross-asset swaps**: sreUSD appreciation and crvUSD/reUSD conversions add complexity
+| Current LTV | Safe LTV | Repay % | Can Withdraw % | Shortfall |
+|-------------|----------|---------|----------------|-----------|
+| 95% | 94% | 50% | 46.8% | 6.4% |
+| 95% | 94% | 75% | 73.4% | 2.1% |
+| 90% | 94% | 50% | 52.1% | 0% (excess!) |
 
-**Empirical result**: With 2x multiplier, a 25% withdrawal returns 99.99% of expected value.
+At high LTV (near liquidation), the shortfall approaches ~8%. The 2x multiplier ensures we always free enough by closing more position than strictly needed.
 
 ### Edge Cases
 
-1. **Full Withdrawal (100%)**: No multiplier needed - close entire position
-2. **2x would exceed 100%**: Cap at 100% (full close)
-3. **Very small withdrawals**: With small amounts, dust thresholds may apply
+1. **Full Withdrawal**: `fractionBps` caps at 100% - close entire position
+2. **Low LTV Position**: May free more than needed - excess parked as buffer
+3. **Multiple Users**: Buffer swept on next operation, fairly distributed
 
-### Code Reference
+## Yearn V3 Loss Mechanism: Fair Cost Distribution
+
+### The Problem: Phantom Assets
+
+When users withdraw from a leveraged strategy, deleverage costs are incurred:
+- Flash loan fees (~0.05%)
+- Swap slippage (~0.1-0.2%)
+
+Without proper handling, these costs accumulate as "phantom assets" - the strategy's cached `totalAssets` remains high while actual position value decreases. The last user to withdraw absorbs ALL accumulated losses.
+
+**Example of the problem:**
+```
+Initial: 3 users, 10,000 reUSD each = 30,000 totalAssets
+
+User 1 withdraws 10,000:
+  - Deleverage costs ~50 reUSD
+  - User receives: 10,000 reUSD
+  - Cached totalAssets: 20,000 (unchanged pro-rata)
+  - Actual position value: 19,950 reUSD
+
+User 2 withdraws 10,000:
+  - Deleverage costs ~50 reUSD
+  - User receives: 10,000 reUSD
+  - Cached totalAssets: 10,000
+  - Actual position value: 9,900 reUSD
+
+User 3 withdraws (last user):
+  - Receives only 9,900 reUSD (actual position)
+  - Absorbs 100 reUSD in losses (1%)
+  - Lost 1% while others paid 0%!
+```
+
+### The Solution: Yearn V3's Built-in Loss Handling
+
+Yearn V3's `TokenizedStrategy._withdraw()` has built-in loss detection:
 
 ```solidity
-// src/SreUSDCrvUSDLoopStrategy.sol
+// TokenizedStrategy.sol - _withdraw function
+function _withdraw(address receiver, address owner, uint256 assets, uint256 maxLoss)
+    internal returns (uint256)
+{
+    // Check idle balance BEFORE freeFunds
+    uint256 idle = _asset.balanceOf(address(this));
+    uint256 loss;
 
-uint256 baseFraction = (_amount * BASIS_POINTS) / positionValue;
+    if (idle < assets) {
+        // Need to free funds from strategy
+        IBaseStrategy(address(this)).freeFunds(assets - idle);
 
-// For partial withdrawals from leveraged positions, extraction efficiency is ~50%
-// because freed collateral mostly goes to debt repayment, not user.
-// 2x multiplier compensates: close 2x more position to get correct equity.
-fractionBps = baseFraction * 2;
-if (fractionBps > BASIS_POINTS) fractionBps = BASIS_POINTS;
+        // Check idle balance AFTER freeFunds
+        idle = _asset.balanceOf(address(this));
+
+        // If idle < assets, the difference is a LOSS
+        if (idle < assets) {
+            loss = assets - idle;
+            require(loss <= (assets * maxLoss) / MAX_BPS, "too much loss");
+            assets = idle;  // User receives what's available
+        }
+    }
+
+    // Accounting: deduct BOTH assets sent AND loss
+    S.totalAssets -= (assets + loss);
+
+    _asset.safeTransfer(receiver, assets);
+    return assets;
+}
 ```
+
+**Key insight**: If `_freeFunds` leaves less reUSD than requested, TokenizedStrategy:
+1. Detects the shortfall as `loss`
+2. Validates against user's `maxLoss` tolerance
+3. Sends user only `idle` amount
+4. Deducts `assets + loss` from `totalAssets` (proper accounting!)
+
+### How We Utilize This Mechanism
+
+To ensure each user pays their own deleverage costs, we measure the actual loss and control the idle balance visible after `_freeFunds` returns.
+
+**Strategy:**
+1. Sweep any existing scrvUSD buffer from previous withdrawals
+2. Snapshot `totalAssets` before deleverage
+3. Use 2x multiplier to free excess funds
+4. Recalculate `totalAssets` after deleverage
+5. Actual loss = `snapshotBefore - snapshotAfter`
+6. Calculate user's proportional loss based on freed amount
+7. Park excess reUSD as scrvUSD (buffer - earns yield while parked!)
+8. Leave exactly `_amount - userLoss` as idle reUSD
+9. TokenizedStrategy sees shortfall, passes cost to user
+
+**Why scrvUSD instead of crvUSD?**
+- **Fewer swaps**: reUSD → scrvUSD (1 swap) vs reUSD → scrvUSD → crvUSD (2 swaps)
+- **Less slippage**: Half the swaps = half the slippage losses
+- **Earns yield**: scrvUSD is a yield-bearing wrapper for crvUSD
+
+**Code flow:**
+```solidity
+function _freeFunds(uint256 _amount) internal override {
+    // 1. Sweep any existing buffer from previous withdrawals
+    if (scrvUSDBuffer > 0) {
+        _sweepScrvUSDBuffer();
+    }
+
+    // 2. Snapshot total assets before deleverage
+    uint256 idleBefore = reUSD.balanceOf(address(this));
+    uint256 totalBefore = _calculateTotalAssets(idleBefore);
+
+    // 3. Deleverage with 2x multiplier - frees ~2x requested amount
+    _freeFundsWithFlashLoan(_amount);
+
+    // 4. Recalculate total assets after deleverage
+    uint256 idleAfter = reUSD.balanceOf(address(this));
+    uint256 totalAfter = _calculateTotalAssets(idleAfter);
+
+    // 5. Calculate actual loss and user's proportional share
+    uint256 actualLoss = totalBefore > totalAfter ? totalBefore - totalAfter : 0;
+    uint256 userLoss = (actualLoss * _amount) / totalBefore;
+
+    // 6. Calculate target idle = requested - user's loss
+    uint256 targetIdle = _amount - userLoss;
+
+    // 7. Park excess as scrvUSD
+    if (idleAfter > targetIdle) {
+        uint256 excess = idleAfter - targetIdle;
+        _parkExcessAsScrvUSD(excess);
+    }
+    // Now idle ≈ targetIdle, TokenizedStrategy sees loss ≈ userLoss
+}
+
+function _deployFunds(uint256 _amount) internal override {
+    // First, sweep any parked scrvUSD back to reUSD
+    _sweepScrvUSDBuffer();
+
+    // Then deploy new funds normally
+    // ...
+}
+```
+
+### Result: Fair Cost Distribution
+
+```
+Initial: 3 users, 10,000 reUSD each = 30,000 totalAssets
+
+User 1 withdraws 10,000:
+  - Sweeps any existing buffer (none on first withdrawal)
+  - Deleverage 66% of position (2x multiplier)
+  - Total freed: ~20,000 reUSD, actual loss: ~1,000
+  - User's proportional loss: 1000 * (10000/20000) = 500
+  - Parks excess as scrvUSD, leaves idle = 9,500
+  - User receives: 9,500 reUSD (pays ~5% deleverage cost)
+
+User 2 withdraws 10,000:
+  - Sweeps scrvUSD buffer first (~10,000 → reUSD)
+  - Deleverage remaining position
+  - User's loss is proportional to their withdrawal
+  - User receives: ~9,950 reUSD
+
+User 3 withdraws 10,000:
+  - Sweeps scrvUSD buffer (position may be empty)
+  - If buffer covers request, no deleverage needed
+  - User receives: ~10,000 reUSD (buffer + scrvUSD yield!)
+```
+
+### Edge Cases
+
+1. **Full withdrawal (100%)**: No parking needed - return everything
+2. **Last user exits**: scrvUSD buffer swept, may receive more than expected (yield!)
+3. **Buffer accumulates**: Gets swept on next withdrawal/deposit
+4. **Loss exceeds request**: Reverts on `maxLoss` check (safe default)
