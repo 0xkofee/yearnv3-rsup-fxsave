@@ -116,6 +116,75 @@ If the deployments do not end at the same address you can also manually send the
 
 # SreUSD/crvUSD Loop Strategy
 
+## Maximum Leverage
+
+### The Formula
+
+Maximum leverage is determined by the combined LTV of both protocols:
+
+```
+Combined LTV = Curve LTV × Resupply LTV
+             = 0.95 × 0.92
+             = 0.874 (87.4%)
+
+Max Leverage = 1 / (1 - Combined LTV)
+             = 1 / (1 - 0.874)
+             = 1 / 0.126
+             ≈ 7.94x
+```
+
+### Why This Limit?
+
+Each loop iteration, you can only borrow 87.4% of what you deposited:
+
+```
+Start:     100 reUSD
+Loop 1:    +87.4 reUSD (borrow 95% from Curve, then 92% from Resupply)
+Loop 2:    +76.4 reUSD (87.4% of 87.4)
+Loop 3:    +66.8 reUSD
+...
+Loop ∞:    Total = 100 / (1 - 0.874) = 794 reUSD position
+```
+
+**794 reUSD position from 100 reUSD equity = 7.94x leverage**
+
+### Practical Leverage (with marginalLoopThreshold)
+
+We don't run infinite loops. The `marginalLoopThreshold` stops iterations when returns diminish:
+
+| Threshold | Stops At | Leverage | % of Max | Gas Saved |
+|-----------|----------|----------|----------|-----------|
+| 5% | ~23 iter | 7.56x | 95.2% | ~5M |
+| **10%** (default) | **~18 iter** | **7.20x** | **90.7%** | **~8M** |
+| 20% | ~13 iter | 6.53x | 82.3% | ~12M |
+
+### Leverage Accumulation by Iteration
+
+```
+Iteration    Cumulative Leverage    Marginal Add
+-------------------------------------------------
+    1             1.00x               1.00x
+    5             4.06x               0.58x
+   10             5.85x               0.26x
+   15             6.85x               0.14x
+   18             7.20x               0.10x  ← 10% threshold stops here
+   20             7.37x               0.07x
+   25             7.64x               0.04x
+   30             7.79x               0.02x
+    ∞             7.94x               0.00x
+```
+
+The last 12 iterations (18→30) only add 0.59x leverage but cost ~8.6M gas.
+
+### Changing Leverage
+
+To increase leverage, you could:
+1. **Lower marginalLoopThreshold** (e.g., 500 = 5%) → more iterations, higher gas
+2. **Increase Resupply LTV** (requires protocol changes)
+3. **Increase Curve LTV** (riskier, closer to liquidation)
+
+Current defaults prioritize gas efficiency over maximum leverage.
+
 ## Leverage vs Deleverage Asymmetry Problem
 
 This strategy builds leveraged positions by looping through Curve LLAMMA and Resupply. A critical issue exists: **leverage is fast, but deleverage is slow**.
