@@ -260,6 +260,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     // Loop parameters
     uint256 public maxIterations;       // Maximum loop iterations to prevent gas issues
     uint256 public minLoopAmount;       // Minimum amount to continue looping (leverage dust threshold)
+    uint256 public marginalLoopThreshold; // Stop when iteration adds < X% of original (in bps, 1000 = 10%)
 
     // Reward token handling
     // DEX types: 0 = Curve (int128 indices), 1 = Uniswap V3, 2 = Curve tricrypto (uint256 indices)
@@ -339,6 +340,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         // Set loop parameters
         maxIterations = 30;          // Maximum 30 loops per operation (need ~20 for 20x leverage)
         minLoopAmount = 1100e18;     // Min 1100 reUSD to continue looping (above Resupply's $1000 minimum borrow)
+        marginalLoopThreshold = 1000; // 10% - stop when iteration adds < 10% of original deposit
         minSellAmount = 5e16;        // Min 0.05 tokens (~$175 for WETH) - allows intermediate token swaps
 
         // Approve tokens for protocol interactions
@@ -374,6 +376,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         // Deploy all available funds (including swept buffer)
         uint256 reUSDToLoop = reUSD.balanceOf(address(this));
+        uint256 originalAmount = reUSDToLoop; // Track original for marginal threshold check
 
         // Query Curve's loan_discount to calculate safe LTV
         // loan_discount is in 1e18 scale (e.g., 2e16 = 2%)
@@ -386,6 +389,10 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         for (uint256 i = 0; i < maxIterations; i++) {
             // Stop if amount becomes too small (dust)
             if (reUSDToLoop < minLoopAmount) break;
+
+            // Stop if marginal contribution is below threshold (e.g., < 10% of original)
+            // This saves gas on diminishing returns iterations
+            if (reUSDToLoop * BASIS_POINTS < originalAmount * marginalLoopThreshold) break;
 
             // a. Deposit reUSD → get sreUSD shares
             uint256 sreUSDShares = sreUSD.deposit(reUSDToLoop, address(this));
@@ -764,16 +771,20 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      * @notice Update loop parameters
      * @param _maxIterations New maximum iterations
      * @param _minLoopAmount New minimum loop amount (for leverage operations)
+     * @param _marginalThreshold Stop when iteration adds < X% of original (in bps, 1000 = 10%)
      */
     function setLoopParameters(
         uint256 _maxIterations,
-        uint256 _minLoopAmount
+        uint256 _minLoopAmount,
+        uint256 _marginalThreshold
     ) external onlyManagement {
         require(_maxIterations > 0 && _maxIterations <= 50, "Invalid max iterations");
         require(_minLoopAmount > 0, "Invalid min loop amount");
+        require(_marginalThreshold > 0 && _marginalThreshold <= 5000, "Invalid marginal threshold"); // 0-50%
 
         maxIterations = _maxIterations;
         minLoopAmount = _minLoopAmount;
+        marginalLoopThreshold = _marginalThreshold;
     }
 
     /**
