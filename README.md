@@ -502,6 +502,29 @@ The shortfall percentage depends on how close current LTV is to safe LTV:
 
 At high LTV (near liquidation), the shortfall approaches ~8%. The 2x multiplier ensures we always free enough by closing more position than strictly needed.
 
+**Why not calculate the optimal minimum flash amount?**
+
+Theoretically, we could calculate the exact flash amount needed:
+```
+flash = (target + K) / M
+where K = position-specific equity offset (~8 reUSD)
+and M = LTV differential = (1/0.94) - 0.92 = 0.144
+```
+
+We chose simplicity over precision for several reasons:
+
+1. **crvUSD path doesn't care** - The preferred flash loan source (crvUSD ERC-3156) has 0% fee. Flashing 100% vs 55% of debt costs nothing extra.
+
+2. **USDC slippage comes from equity** - When falling back to USDC flash loans, the round-trip swap slippage (~0.02%) is covered from position equity via the shortfall mechanism, not proportional to flash amount.
+
+3. **Failure mode is ugly** - If the optimal calculation is off by even a small margin due to rate changes mid-transaction, the flash loan repayment fails. With 2x, we're always covered.
+
+4. **Gas savings are marginal** - Larger flash amounts don't dramatically increase gas. The overhead is in flash loan routing, not the amount.
+
+5. **Complexity vs benefit** - The math requires solving position-dependent equations with safety buffers. The implementation complexity isn't worth the minimal savings.
+
+The only scenario where optimal calculation would matter: if crvUSD flash liquidity is frequently constrained below the 2x requirement, forcing USDC fallback. In practice, this hasn't been an issue.
+
 ### Edge Cases
 
 1. **Full Withdrawal**: `fractionBps` caps at 100% - close entire position

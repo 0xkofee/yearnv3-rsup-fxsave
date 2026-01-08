@@ -427,6 +427,60 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     }
 
     /**
+     * @notice External wrapper for re-deploying exact amount to enable try/catch
+     * @param _amount Amount of reUSD to deploy (exact, not full balance)
+     * @dev Only callable by this contract. Used for re-leverage after withdrawals.
+     *      Unlike _deployFunds, this does NOT sweep buffer and deploys ONLY _amount.
+     */
+    function deployExactExternal(uint256 _amount) external {
+        require(msg.sender == address(this), "Only self");
+        _deployExactAmount(_amount);
+    }
+
+    /**
+     * @notice Deploy exact amount of reUSD (no buffer sweep, no full balance deploy)
+     * @param _amount Exact amount of reUSD to deploy
+     * @dev Used for re-leverage after withdrawals. Does NOT touch scrvUSD buffer
+     *      and only deploys the specified amount, leaving other idle funds alone.
+     */
+    function _deployExactAmount(uint256 _amount) internal {
+        if (_amount == 0) return;
+
+        // Use exact amount specified, not full balance
+        uint256 reUSDToLoop = _amount;
+        uint256 originalAmount = _amount;
+
+        // Query Curve's loan_discount to calculate safe LTV
+        uint256 loanDiscount = curveLLAMMA.loan_discount();
+        uint256 safeCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
+
+        // Loop to build leverage
+        for (uint256 i = 0; i < maxIterations; i++) {
+            if (reUSDToLoop < minLoopAmount) break;
+            // Stop when iteration adds < threshold% of original (e.g., 10%) - diminishing returns
+            if (reUSDToLoop * BASIS_POINTS < originalAmount * marginalLoopThreshold) break;
+
+            uint256 sreUSDShares = sreUSD.deposit(reUSDToLoop, address(this));
+            if (sreUSDShares == 0) break;
+
+            uint256 sreUSDValue = sreUSD.convertToAssets(sreUSDShares);
+            uint256 borrowAmount = (sreUSDValue * safeCurveLTV) / BASIS_POINTS;
+            if (borrowAmount == 0) break;
+
+            _supplyAndBorrow(sreUSDShares, borrowAmount);
+
+            // Assumes crvUSD ≈ reUSD ≈ $1 (conservative if reUSD depegs)
+            uint256 reUSDBorrowAmount = (borrowAmount * targetResupplyLTV) / BASIS_POINTS;
+
+            try resupplyPair.borrow(reUSDBorrowAmount, borrowAmount, address(this)) {
+                reUSDToLoop = reUSDBorrowAmount;
+            } catch {
+                break;
+            }
+        }
+    }
+
+    /**
      * @notice Free funds from the strategy by deleveraging
      * @param _amount Amount of reUSD to free (excludes idle balance)
      * @dev Uses flash loan for atomic deleverage. Withdrawing user pays full deleverage cost.
@@ -507,11 +561,23 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         emit LossCalculated(totalPreDeleverage, totalPostDeleverage, actualLoss, targetIdle);
 
-        // 9. Park excess reUSD as scrvUSD to hide from idle balance
-        // This ensures TokenizedStrategy sees idle < assets and passes loss to user
-        if (idlePostDeleverage > targetIdle) {
+        // 9. Re-deploy excess funds to maintain leverage for remaining depositors
+        // Skip if: full withdrawal, shutdown, or no excess
+        if (!isFullWithdrawal && !TokenizedStrategy.isShutdown() && idlePostDeleverage > targetIdle) {
             uint256 excess = idlePostDeleverage - targetIdle;
-            _parkExcessAsScrvUSD(excess);
+            if (excess > minLoopAmount) {
+                // Try to re-deploy, fall back to parking if it fails
+                // This ensures withdrawals always succeed even if protocols are down
+                try this.deployExactExternal(excess) {
+                    // Re-deploy succeeded - remaining depositors are re-leveraged
+                } catch {
+                    // Re-deploy failed - park as scrvUSD, will be deployed on next report()
+                    _parkExcessAsScrvUSD(excess);
+                }
+            } else if (excess > 0) {
+                // Below threshold - park as scrvUSD (will be deployed on next deposit/report)
+                _parkExcessAsScrvUSD(excess);
+            }
         }
         // Now idle ≈ targetIdle, TokenizedStrategy sees loss ≈ userLoss
     }

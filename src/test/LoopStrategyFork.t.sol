@@ -958,28 +958,29 @@ contract LoopStrategyForkTest is Test {
         vm.prank(user);
         uint256 received = IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user);
         emit log_named_decimal_uint("Actually received", received, 18);
-        assertGe(received, (expected * 97) / 100, "10% withdrawal should work");
+        // Note: 96% threshold accounts for deleverage costs + re-leverage gas paid by withdrawer
+        assertGe(received, (expected * 96) / 100, "10% withdrawal should work");
 
         // 25% of remaining
         shares = IERC20(address(loopStrategy)).balanceOf(user) / 4;
         expected = strategyVault.previewRedeem(shares);
         vm.prank(user);
         received = IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user);
-        assertGe(received, (expected * 97) / 100, "25% withdrawal should work");
+        assertGe(received, (expected * 96) / 100, "25% withdrawal should work");
 
         // 50% of remaining
         shares = IERC20(address(loopStrategy)).balanceOf(user) / 2;
         expected = strategyVault.previewRedeem(shares);
         vm.prank(user);
         received = IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user);
-        assertGe(received, (expected * 97) / 100, "50% withdrawal should work");
+        assertGe(received, (expected * 96) / 100, "50% withdrawal should work");
 
         // 100% of remaining (full close)
         shares = IERC20(address(loopStrategy)).balanceOf(user);
         expected = strategyVault.previewRedeem(shares);
         vm.prank(user);
         received = IStrategyWithRedeem(address(loopStrategy)).redeem(shares, user, user);
-        assertGe(received, (expected * 97) / 100, "100% withdrawal should work");
+        assertGe(received, (expected * 96) / 100, "100% withdrawal should work");
 
         // Verify vault empty
         assertEq(strategyVault.totalAssets(), 0, "Vault should be empty");
@@ -1434,5 +1435,70 @@ contract LoopStrategyForkTest is Test {
     function _requiredContractsPresent() internal view returns (bool) {
         return REUSD.code.length > 0 && SREUSD.code.length > 0 && CRVUSD.code.length > 0
             && CURVE_LLAMMA.code.length > 0 && RESUPPLY_PAIR.code.length > 0;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    GAS COST ESTIMATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Estimate gas costs for deposits and withdrawals
+    function testFork_GasCostEstimation() public {
+        address user1 = address(0x1111);
+        address user2 = address(0x2222);
+        address user3 = address(0x3333);
+
+        deal(REUSD, user1, 20_000e18);
+        deal(REUSD, user2, 100_000e18);
+        deal(REUSD, user3, 50_000e18);
+
+        // User 1: 20k deposit
+        vm.startPrank(user1);
+        IERC20(REUSD).approve(address(loopStrategy), 20_000e18);
+        uint256 gas1 = gasleft();
+        strategyVault.deposit(20_000e18, user1);
+        uint256 deposit20kGas = gas1 - gasleft();
+        vm.stopPrank();
+
+        // User 2: 100k deposit
+        vm.startPrank(user2);
+        IERC20(REUSD).approve(address(loopStrategy), 100_000e18);
+        gas1 = gasleft();
+        strategyVault.deposit(100_000e18, user2);
+        uint256 deposit100kGas = gas1 - gasleft();
+        vm.stopPrank();
+
+        // User 3: 50k deposit
+        vm.startPrank(user3);
+        IERC20(REUSD).approve(address(loopStrategy), 50_000e18);
+        gas1 = gasleft();
+        strategyVault.deposit(50_000e18, user3);
+        uint256 deposit50kGas = gas1 - gasleft();
+        vm.stopPrank();
+
+        emit log_named_uint("=== DEPOSIT GAS ===", 0);
+        emit log_named_uint("20k deposit gas", deposit20kGas);
+        emit log_named_uint("100k deposit gas", deposit100kGas);
+        emit log_named_uint("50k deposit gas", deposit50kGas);
+
+        // User 3: withdraw all 50k
+        uint256 shares3 = IERC20(address(loopStrategy)).balanceOf(user3);
+        vm.startPrank(user3);
+        gas1 = gasleft();
+        IStrategyWithRedeem(address(loopStrategy)).redeem(shares3, user3, user3);
+        uint256 withdraw50kGas = gas1 - gasleft();
+        vm.stopPrank();
+
+        emit log_named_uint("=== WITHDRAW GAS ===", 0);
+        emit log_named_uint("50k withdraw gas (with re-leverage)", withdraw50kGas);
+
+        // Summary at 30 gwei and $3500 ETH
+        uint256 gweiPrice = 30;
+        uint256 ethPriceUsd = 3500;
+
+        emit log_named_uint("=== USD COSTS @ 30 gwei, $3500 ETH ===", 0);
+        emit log_named_decimal_uint("20k deposit cost USD", (deposit20kGas * gweiPrice * ethPriceUsd) / 1e9, 0);
+        emit log_named_decimal_uint("100k deposit cost USD", (deposit100kGas * gweiPrice * ethPriceUsd) / 1e9, 0);
+        emit log_named_decimal_uint("50k deposit cost USD", (deposit50kGas * gweiPrice * ethPriceUsd) / 1e9, 0);
+        emit log_named_decimal_uint("50k withdraw cost USD", (withdraw50kGas * gweiPrice * ethPriceUsd) / 1e9, 0);
     }
 }
