@@ -605,6 +605,34 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     }
 
     /**
+     * @notice Execute flash loan deleverage starting from USDC (Balancer/Aave path)
+     * @param flashedUSDC Amount of USDC flash loaned (6 decimals)
+     * @param fractionBps Fraction of position to deleverage (in basis points)
+     * @param usdcOwed Amount of USDC owed for repayment (principal + fee)
+     * @dev Unwinds leveraged position:
+     *      1. Swap USDC → crvUSD
+     *      2. Core deleverage logic
+     *      3. Swap crvUSD → USDC and cover shortfall
+     */
+    function _executeFlashLoanDeleverageFromUSDC(uint256 flashedUSDC, uint256 fractionBps, uint256 usdcOwed) internal {
+        // Swap USDC → crvUSD with slippage protection
+        uint256 expectedOut = crvUSDUSDCPool.get_dy(usdcIndexInPool, crvUSDIndexInPool, flashedUSDC);
+        uint256 minOut = expectedOut * (BASIS_POINTS - swapSlippageBps) / BASIS_POINTS;
+        uint256 crvUSDReceived = crvUSDUSDCPool.exchange(
+            usdcIndexInPool,
+            crvUSDIndexInPool,
+            flashedUSDC,
+            minOut
+        );
+
+        // Core deleverage (operates on crvUSD)
+        _executeFlashLoanDeleverage(crvUSDReceived, fractionBps);
+
+        // Swap crvUSD → USDC and cover shortfall for repayment
+        _swapCrvUSDToUSDCAndCoverShortfall(usdcOwed);
+    }
+
+    /**
      * @notice Free funds from the strategy by deleveraging
      * @param _amount Amount of reUSD to free (excludes idle balance)
      * @dev Uses flash loan for atomic deleverage. Withdrawing user pays full deleverage cost.
@@ -1541,22 +1569,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         } else {
             // Flash loan for deleverage
             (, uint256 fractionBps) = abi.decode(userData, (FlashLoanOperation, uint256));
-
-            // Swap USDC → crvUSD with slippage protection
-            uint256 expectedOut = crvUSDUSDCPool.get_dy(usdcIndexInPool, crvUSDIndexInPool, amounts[0]);
-            uint256 minOut = expectedOut * (BASIS_POINTS - swapSlippageBps) / BASIS_POINTS;
-            uint256 crvUSDReceived = crvUSDUSDCPool.exchange(
-                usdcIndexInPool,
-                crvUSDIndexInPool,
-                amounts[0],
-                minOut
-            );
-
-            // Core deleverage (operates on crvUSD)
-            _executeFlashLoanDeleverage(crvUSDReceived, fractionBps);
-
-            // Swap crvUSD → USDC and cover shortfall for repayment
-            _swapCrvUSDToUSDCAndCoverShortfall(amountOwed);
+            _executeFlashLoanDeleverageFromUSDC(amounts[0], fractionBps, amountOwed);
         }
 
         // Repay by transferring USDC back to Balancer vault
@@ -1595,22 +1608,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         } else {
             // Flash loan for deleverage
             (, uint256 fractionBps) = abi.decode(params, (FlashLoanOperation, uint256));
-
-            // Swap USDC → crvUSD with slippage protection
-            uint256 expectedOut = crvUSDUSDCPool.get_dy(usdcIndexInPool, crvUSDIndexInPool, amount);
-            uint256 minOut = expectedOut * (BASIS_POINTS - swapSlippageBps) / BASIS_POINTS;
-            uint256 crvUSDReceived = crvUSDUSDCPool.exchange(
-                usdcIndexInPool,
-                crvUSDIndexInPool,
-                amount,
-                minOut
-            );
-
-            // Core deleverage (operates on crvUSD)
-            _executeFlashLoanDeleverage(crvUSDReceived, fractionBps);
-
-            // Swap crvUSD → USDC and cover shortfall for repayment
-            _swapCrvUSDToUSDCAndCoverShortfall(amountOwed);
+            _executeFlashLoanDeleverageFromUSDC(amount, fractionBps, amountOwed);
         }
 
         // Aave pulls repayment via transferFrom (approval already set)
