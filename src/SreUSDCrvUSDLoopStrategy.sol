@@ -409,9 +409,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         uint256 reUSDToLoop = _amount;
         uint256 originalAmount = _amount;
 
-        // Query Curve's loan_discount to calculate safe LTV
-        uint256 loanDiscount = curveLLAMMA.loan_discount();
-        uint256 safeCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
+        uint256 safeCurveLTV = _getSafeCurveLTV();
 
         // Loop to build leverage
         for (uint256 i = 0; i < maxIterations; i++) {
@@ -466,6 +464,18 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     }
 
     /**
+     * @notice Get safe Curve LTV based on current loan_discount and buffer
+     * @return Safe LTV in basis points (e.g., 9200 = 92%)
+     * @dev Formula: 100% - loan_discount - curveLTVBuffer
+     *      loan_discount is Curve's safety margin (typically 2-5%)
+     *      curveLTVBuffer is our additional safety margin (default 6%)
+     */
+    function _getSafeCurveLTV() internal view returns (uint256) {
+        uint256 loanDiscount = curveLLAMMA.loan_discount();
+        return BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
+    }
+
+    /**
      * @notice Calculate how much to flash loan for a given deposit to build max safe leverage
      * @param forUSDCPath Whether this is for USDC flash (needs extra buffer for swaps/fees)
      * @return multiplier Flash amount = deposit * multiplier / BASIS_POINTS
@@ -475,8 +485,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
      *      Apply 93% for crvUSD path, 90% for USDC path (extra buffer for slippage + fees)
      */
     function _calculateSafeLeverageMultiplier(bool forUSDCPath) internal view returns (uint256) {
-        uint256 loanDiscount = curveLLAMMA.loan_discount();
-        uint256 targetCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
+        uint256 targetCurveLTV = _getSafeCurveLTV();
 
         // denominator = 1 - (targetCurveLTV * targetResupplyLTV)
         uint256 denominator = BASIS_POINTS - (targetCurveLTV * targetResupplyLTV / BASIS_POINTS);
@@ -548,8 +557,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         // Step 3: Supply sreUSD to Curve, borrow crvUSD at safe LTV
         uint256 sreUSDValue = sreUSD.convertToAssets(sreUSDShares);
-        uint256 loanDiscount = curveLLAMMA.loan_discount();
-        uint256 safeCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
+        uint256 safeCurveLTV = _getSafeCurveLTV();
         uint256 crvUSDBorrowable = (sreUSDValue * safeCurveLTV) / BASIS_POINTS;
 
         // Ensure we can borrow enough to repay flash loan
@@ -1718,7 +1726,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
             if (curveDebtRemaining > 0) {
                 // Still have debt - can only withdraw excess above safe LTV
                 uint256 sreUSDCollateralValue = sreUSD.convertToAssets(sreUSDCollateral);
-                uint256 safeCurveLTV = 9400; // 94% safe LTV (1% buffer below 95% target)
+                uint256 safeCurveLTV = _getSafeCurveLTV();
                 uint256 minCollateralValue = (curveDebtRemaining * BASIS_POINTS) / safeCurveLTV;
 
                 if (sreUSDCollateralValue > minCollateralValue) {
