@@ -231,6 +231,31 @@ Max flash multiplier = safeCurveLTV / (1 - safeCurveLTV × targetResupplyLTV)
                      = 6.95x
 ```
 
+### Why Exceeding the Max Multiplier Fails
+
+If you try to flash more than 6.95x, you can't repay the loan. Example with **8x**:
+
+```
+Deposit: X = 1000 reUSD
+Flash:   F = 8000 crvUSD (8x)
+
+Step 1: Deposit 8000 crvUSD to Resupply
+Step 2: Borrow 0.92 × 8000 = 7360 reUSD
+Step 3: Total reUSD = 1000 + 7360 = 8360 → deposit as sreUSD → supply to Curve
+Step 4: Borrow from Curve = 0.94 × 8360 = 7858 crvUSD
+Step 5: Need to repay 8000 crvUSD, but only have 7858
+
+Shortfall: 8000 - 7858 = 142 crvUSD ❌
+```
+
+At exactly 6.95x, the math balances:
+```
+Flash:   F = 6950 crvUSD (6.95x)
+Borrow from Resupply: 0.92 × 6950 = 6394 reUSD
+Total sreUSD value: 1000 + 6394 = 7394
+Borrow from Curve: 0.94 × 7394 = 6950 crvUSD ✓
+```
+
 ### Why 6.5x (Not 6.95x)?
 
 We use **6.5x** instead of the theoretical maximum for safety buffer:
