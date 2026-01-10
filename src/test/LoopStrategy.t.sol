@@ -19,8 +19,8 @@ contract LoopStrategyHarness is SreUSDCrvUSDLoopStrategy {
         string memory _name
     ) SreUSDCrvUSDLoopStrategy(_reUSD, _sreUSD, _crvUSD, _curveLLAMMA, _resupplyPair, _name) {}
 
-    function exposed_calculateFlashMultiplier(bool forUSDCPath) external view returns (uint256) {
-        return _calculateFlashMultiplier(forUSDCPath);
+    function exposed_calculateSafeLeverageMultiplier(bool forUSDCPath) external view returns (uint256) {
+        return _calculateSafeLeverageMultiplier(forUSDCPath);
     }
 }
 
@@ -291,7 +291,7 @@ contract FlashMultiplierTest is Setup {
         );
     }
 
-    function test_calculateFlashMultiplier_crvUSDPath() public {
+    function test_calculateSafeLeverageMultiplier_crvUSDPath() public {
         // Mock returns loan_discount = 2e16 (2%)
         // curveLTVBuffer = 600 (6%) set in constructor
         // targetCurveLTV = 10000 - 200 - 600 = 9200 (92%)
@@ -300,21 +300,21 @@ contract FlashMultiplierTest is Setup {
         // maxMultiplier = 9200 * 10000 / 1536 = 59895 (5.99x)
         // With 93% safety: 59895 * 93 / 100 = 55702 (5.57x)
 
-        uint256 multiplier = harness.exposed_calculateFlashMultiplier(false);
+        uint256 multiplier = harness.exposed_calculateSafeLeverageMultiplier(false);
 
         assertEq(multiplier, 55702, "crvUSD multiplier mismatch");
     }
 
-    function test_calculateFlashMultiplier_USDCPath() public {
+    function test_calculateSafeLeverageMultiplier_USDCPath() public {
         // maxMultiplier = 59895
         // USDC path: 59895 * 90 / 100 = 53905 (5.39x)
 
-        uint256 multiplier = harness.exposed_calculateFlashMultiplier(true);
+        uint256 multiplier = harness.exposed_calculateSafeLeverageMultiplier(true);
 
         assertEq(multiplier, 53905, "USDC multiplier mismatch");
     }
 
-    function test_calculateFlashMultiplier_Formula() public {
+    function test_calculateSafeLeverageMultiplier_Formula() public {
         // Verify the formula matches expected calculation
         // loan_discount = 2e16 (2%), curveLTVBuffer = 600 (6%)
         // targetCurveLTV = 10000 - 200 - 600 = 9200 bps
@@ -328,7 +328,7 @@ contract FlashMultiplierTest is Setup {
         uint256 maxMultiplier = (targetCurveLTV * BASIS_POINTS) / denominator;
         uint256 expectedCrvUSD = maxMultiplier * 93 / 100;
 
-        uint256 actual = harness.exposed_calculateFlashMultiplier(false);
+        uint256 actual = harness.exposed_calculateSafeLeverageMultiplier(false);
 
         assertEq(actual, expectedCrvUSD, "Formula mismatch");
 
@@ -336,9 +336,9 @@ contract FlashMultiplierTest is Setup {
         emit log_named_uint("Actual multiplier", actual);
     }
 
-    function test_calculateFlashMultiplier_BothPaths() public {
-        uint256 crvUSDMultiplier = harness.exposed_calculateFlashMultiplier(false);
-        uint256 usdcMultiplier = harness.exposed_calculateFlashMultiplier(true);
+    function test_calculateSafeLeverageMultiplier_BothPaths() public {
+        uint256 crvUSDMultiplier = harness.exposed_calculateSafeLeverageMultiplier(false);
+        uint256 usdcMultiplier = harness.exposed_calculateSafeLeverageMultiplier(true);
 
         // Verify relationship: both derive from same maxMultiplier (59895)
         // crvUSD = 59895 * 93 / 100 = 55702

@@ -466,13 +466,15 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     }
 
     /**
-     * @notice Calculate safe flash loan multiplier based on current LTV parameters
+     * @notice Calculate how much to flash loan for a given deposit to build max safe leverage
      * @param forUSDCPath Whether this is for USDC flash (needs extra buffer for swaps/fees)
      * @return multiplier Flash amount = deposit * multiplier / BASIS_POINTS
-     * @dev Formula: maxMultiplier = targetCurveLTV / (1 - targetCurveLTV * targetResupplyLTV)
-     *      Apply 93% for crvUSD path, 90% for USDC path (slippage + fees)
+     * @dev Given a deposit, we flash loan (deposit * multiplier) to build a leveraged position.
+     *      The multiplier is derived from LTV constraints on both Curve and Resupply.
+     *      Formula: maxMultiplier = targetCurveLTV / (1 - targetCurveLTV * targetResupplyLTV)
+     *      Apply 93% for crvUSD path, 90% for USDC path (extra buffer for slippage + fees)
      */
-    function _calculateFlashMultiplier(bool forUSDCPath) internal view returns (uint256) {
+    function _calculateSafeLeverageMultiplier(bool forUSDCPath) internal view returns (uint256) {
         uint256 loanDiscount = curveLLAMMA.loan_discount();
         uint256 targetCurveLTV = BASIS_POINTS - (loanDiscount * BASIS_POINTS / 1e18) - curveLTVBuffer;
 
@@ -503,7 +505,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
 
         // Try 1: crvUSD flash (0% fee, no swaps) - always first
         if (address(crvUSDFlashLender) != address(0)) {
-            uint256 crvUSDMultiplier = _calculateFlashMultiplier(false);
+            uint256 crvUSDMultiplier = _calculateSafeLeverageMultiplier(false);
             uint256 crvUSDToFlash = (_reUSDAmount * crvUSDMultiplier) / BASIS_POINTS;
 
             uint256 available = crvUSDFlashLender.maxFlashLoan(address(crvUSD));
@@ -514,7 +516,7 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
         }
 
         // Try 2: USDC flash via configured provider (Balancer or Aave)
-        uint256 usdcMultiplier = _calculateFlashMultiplier(true);
+        uint256 usdcMultiplier = _calculateSafeLeverageMultiplier(true);
         uint256 crvUSDEquivalent = (_reUSDAmount * usdcMultiplier) / BASIS_POINTS;
         uint256 usdcToFlash = crvUSDEquivalent / 1e12; // 18 decimals -> 6 decimals
         require(usdcToFlash > 0, "Flash amount too small");
