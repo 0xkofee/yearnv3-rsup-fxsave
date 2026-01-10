@@ -1459,14 +1459,8 @@ contract SreUSDCrvUSDLoopStrategy is BaseStrategy {
     /**
      * @notice Free funds using flash loan for atomic deleverage
      * @param _amount Amount of reUSD to free from the leveraged position
-     * @dev Uses configured flash loan provider to atomically close positions:
-     *      1. Flash loan USDC
-     *      2. Swap USDC → crvUSD
-     *      3. Repay Curve debt → unlock sreUSD
-     *      4. Redeem sreUSD → reUSD
-     *      5. Repay Resupply debt → unlock crvUSD
-     *      6. Swap crvUSD → USDC
-     *      7. Repay flash loan
+     * @dev Calculates fraction of position to close based on _amount, then flash loans
+     *      crvUSD (or USDC→crvUSD) to atomically unwind. See _executeFlashLoanDeleverage.
      */
     function _freeFundsWithFlashLoan(uint256 _amount) internal {
         uint256 currentIdle = reUSD.balanceOf(address(this));
