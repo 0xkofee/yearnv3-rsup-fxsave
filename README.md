@@ -148,46 +148,9 @@ Loop ∞:    Total = 100 / (1 - 0.874) = 794 reUSD position
 
 **794 reUSD position from 100 reUSD equity = 7.94x leverage**
 
-### Practical Leverage (with marginalLoopThreshold)
-
-We don't run infinite loops. The `marginalLoopThreshold` stops iterations when returns diminish:
-
-| Threshold | Stops At | Leverage | % of Max | Gas Saved |
-|-----------|----------|----------|----------|-----------|
-| 5% | ~23 iter | 7.56x | 95.2% | ~5M |
-| **10%** (default) | **~18 iter** | **7.20x** | **90.7%** | **~8M** |
-| 20% | ~13 iter | 6.53x | 82.3% | ~12M |
-
-### Leverage Accumulation by Iteration
-
-```
-Iteration    Cumulative Leverage    Marginal Add
--------------------------------------------------
-    1             1.00x               1.00x
-    5             4.06x               0.58x
-   10             5.85x               0.26x
-   15             6.85x               0.14x
-   18             7.20x               0.10x  ← 10% threshold stops here
-   20             7.37x               0.07x
-   25             7.64x               0.04x
-   30             7.79x               0.02x
-    ∞             7.94x               0.00x
-```
-
-The last 12 iterations (18→30) only add 0.59x leverage but cost ~8.6M gas.
-
-### Changing Leverage
-
-To increase leverage, you could:
-1. **Lower marginalLoopThreshold** (e.g., 500 = 5%) → more iterations, higher gas
-2. **Increase Resupply LTV** (requires protocol changes)
-3. **Increase Curve LTV** (riskier, closer to liquidation)
-
-Current defaults prioritize gas efficiency over maximum leverage.
-
 ## Flash Loan Leverage for Deposits
 
-Instead of iterating 18 times to build leverage, we can use a flash loan to achieve target leverage in **one transaction**, saving ~60-70% gas.
+The strategy uses flash loans to build leveraged positions in a single transaction.
 
 ### The Math
 
@@ -256,195 +219,33 @@ Total sreUSD value: 1000 + 6394 = 7394
 Borrow from Curve: 0.94 × 7394 = 6950 crvUSD ✓
 ```
 
-### Why 6.5x (Not 6.95x)?
+### Dynamic Safety Buffers
 
-We use **6.5x** instead of the theoretical maximum for safety buffer:
-- Price fluctuations during transaction
-- Rounding errors in protocol math
-- Small slippage in sreUSD deposit
+The strategy calculates the flash multiplier dynamically using `_calculateSafeLeverageMultiplier()`:
 
 ```
-6.5x gives ~7% buffer below theoretical max
+maxMultiplier = safeCurveLTV / (1 - safeCurveLTV × targetResupplyLTV)
 ```
 
-### Resulting Leverage
+Safety buffers are applied based on the flash loan path:
 
-With F = 6.5X:
-```
-Total sreUSD position = X + 0.92 × 6.5X = X + 5.98X = 6.98X
-Effective leverage ≈ 7x
-```
+| Path | Buffer | Effective Multiplier | Reason |
+|------|--------|---------------------|--------|
+| crvUSD | 93% of max | ~6.47x | No swap overhead |
+| USDC | 90% of max | ~6.26x | Round-trip slippage + potential Aave fee |
 
-This matches the iterative loop result (~7x after 18 iterations), but in **one transaction**.
+The USDC path needs a larger buffer because:
+- ~0.04% round-trip slippage (crvUSD↔USDC swaps)
+- 0.05% Aave fee (when using Aave as fallback)
 
-### Gas Comparison
+### Flash Loan Provider Priority
 
-| Method | Iterations | Gas | Cost @ 30 gwei |
-|--------|------------|-----|----------------|
-| Iterative | 18 | ~10M | ~$1,000 |
-| Flash Loan | 1 | ~3-4M | ~$350 |
-| **Savings** | | | **~$650 (65%)** |
+1. **crvUSD flash** (0% fee) - Always tried first if configured and has sufficient liquidity
+2. **USDC flash** - Falls back to the configured `flashLoanProvider`:
+   - `BALANCER` (default): 0% fee
+   - `AAVE`: 0.05% fee
 
-### Fallback Behavior
-
-The strategy automatically falls back to iterative looping when:
-- Deposit amount < `minFlashLeverageAmount` (default 5000 reUSD)
-- Flash lender not configured
-- Insufficient flash loan liquidity
-- Flash loan fails for any reason
-
-## Leverage vs Deleverage Asymmetry Problem
-
-This strategy builds leveraged positions by looping through Curve LLAMMA and Resupply. A critical issue exists: **leverage is fast, but deleverage is slow**.
-
-### The Problem
-
-**Leverage (Deposit):**
-```
-Each iteration:
-1. Deposit collateral (e.g., 10k sreUSD)
-2. Borrow at 95% LTV → get 9.5k crvUSD
-3. Deposit crvUSD, borrow at 92% LTV → get 8.7k reUSD
-4. Loop with 8.7k (87% of previous)
-
-Pattern: Geometric decay → converges fast in ~14 iterations
-```
-
-**Deleverage (Withdraw):**
-```
-Each iteration:
-1. Use available reUSD to repay debt
-2. Withdraw collateral - BUT limited by LTV constraints
-3. Can only withdraw EXCESS above minimum safe LTV
-4. Convert to reUSD, repeat
-
-Pattern: Slow linear climb → needs ~16+ iterations for same position
-```
-
-### Why Deleverage is Slower
-
-| Phase | Pattern | Constraint |
-|-------|---------|------------|
-| Leverage | Borrow 87% of new collateral each step | Only limited by max LTV |
-| Deleverage | Free only excess above min LTV each step | Must maintain LTV while unwinding |
-
-**Example:** At 85% LTV with 80% minimum:
-- Can only withdraw 5% of position per iteration
-- But leverage can borrow 87% per iteration
-
-### Real Test Data
-
-For a 10,000 reUSD deposit:
-- **Leverage:** 14 iterations (9k → 7.6k → 6.5k → ... → done)
-- **Deleverage:** 16 iterations (1k → 736 → 890 → ... → 10k)
-
-Note iteration 1 of deleverage: balance **dropped** from 1,000 to 736! We spent 1,000 on debt repayment but LTV only allowed 736 of collateral withdrawal.
-
-### Deposit Size Limits
-
-With `maxIterations = 30`:
-- 10,000 reUSD: ✓ Works (15 iterations)
-- 20,000 reUSD: ✓ Works (30 iterations)
-- 21,000 reUSD: ✓ Works (just fits)
-- 21,500 reUSD: ✗ Fails (needs 31+ iterations)
-
-**Roughly ~700 reUSD freed per deleverage iteration at current LTV settings.**
-
-### Protection Mechanism
-
-The strategy includes a slippage check at the end of `_freeFunds`:
-
-```solidity
-if (finalBalance < userReceives) {
-    uint256 shortfall = userReceives - finalBalance;
-    uint256 maxSlippage = userReceives / 100; // 1%
-    require(shortfall <= maxSlippage, "Deleverage failed: insufficient funds freed");
-}
-```
-
-This prevents silent partial withdrawals where users would lose funds without any error.
-
-### Potential Solution: Flash Loan Deleverage
-
-The iterative deleverage is slow because we're trapped in a cycle:
-- Need to repay debt to withdraw collateral
-- Need collateral to get funds to repay debt
-
-**Flash loans break this cycle.**
-
-#### Current Position Structure
-
-```
-User deposits reUSD
-    ↓
-reUSD → sreUSD (via deposit)
-    ↓
-sreUSD deposited to Curve LLAMMA as collateral
-    ↓
-Borrow crvUSD from Curve (debt #1)
-    ↓
-crvUSD deposited to Resupply as collateral
-    ↓
-Borrow reUSD from Resupply (debt #2)
-    ↓
-Loop with borrowed reUSD...
-```
-
-#### Flash Loan Deleverage Flow
-
-```
-1. Flash loan reUSD (amount = Resupply debt)
-2. Repay ALL Resupply reUSD debt → debt #2 = 0
-3. Withdraw ALL crvUSD collateral from Resupply (no LTV constraint!)
-4. Repay ALL Curve crvUSD debt → debt #1 = 0
-5. Withdraw ALL sreUSD collateral from Curve (no LTV constraint!)
-6. Redeem sreUSD → reUSD
-7. Repay flash loan
-8. Return remainder to user
-```
-
-#### Comparison
-
-| Metric | Iterative | Flash Loan |
-|--------|-----------|------------|
-| Iterations | 15-30 | 1 |
-| Gas cost | High (~25M gas) | Lower (~5M gas) |
-| Deposit limit | ~21k reUSD | Unlimited* |
-| Complexity | Simple loops | Callback handling |
-| External dependency | None | Flash loan provider |
-
-*Limited only by flash loan liquidity
-
-#### Implementation Considerations
-
-1. **Flash Loan Sources:**
-   - Aave V3 (0.05% fee for most assets)
-   - Balancer (no fee)
-   - Uniswap V3 (0.3% swap fee if using flash swap)
-   - Curve (if pool has sufficient liquidity)
-
-2. **Callback Pattern:**
-   ```solidity
-   function executeOperation(
-       address[] calldata assets,
-       uint256[] calldata amounts,
-       uint256[] calldata premiums,
-       address initiator,
-       bytes calldata params
-   ) external returns (bool) {
-       // 1. Repay Resupply debt
-       // 2. Withdraw crvUSD collateral
-       // 3. Repay Curve debt
-       // 4. Withdraw sreUSD collateral
-       // 5. Redeem sreUSD → reUSD
-       // 6. Approve repayment
-       return true;
-   }
-   ```
-
-3. **Partial Deleverage - The 2x Multiplier:**
-
-   Partial withdrawals from leveraged positions require closing MORE than the proportional fraction. See detailed explanation below.
+If crvUSD flash has insufficient liquidity and the USDC provider isn't configured, the transaction reverts.
 
 ## Partial Withdrawal Math: Why We Use a 2x Multiplier
 
@@ -452,107 +253,93 @@ When a user makes a partial withdrawal from a leveraged position, the naive appr
 
 ### Step 1: Building the Leveraged Position
 
-User deposits **100 reUSD**. The strategy loops to build leverage:
+User deposits **100 reUSD**. The strategy uses a flash loan to build leverage in one transaction:
 
 ```
-Iteration 1:
-  - 100 reUSD → 100 sreUSD (deposit to sreUSD vault)
-  - Deposit 100 sreUSD to Curve LLAMMA as collateral
-  - Borrow 95 crvUSD at 95% LTV
-  - Deposit 95 crvUSD to Resupply as collateral
-  - Borrow 87.4 reUSD at 92% LTV
-
-Iteration 2:
-  - 87.4 reUSD → 87.4 sreUSD
-  - Add to Curve (total: 187.4 sreUSD), borrow more → total debt: 178 crvUSD
-  - Add to Resupply (total: 178 crvUSD), borrow more → total debt: 163.8 reUSD
-
-Iterations 3-14: Continue until amounts < minLoopAmount
+1. Flash loan 650 crvUSD (~6.5x deposit)
+2. Deposit 650 crvUSD to Resupply → borrow 598 reUSD (92% LTV)
+3. Total reUSD: 100 + 598 = 698 → deposit as sreUSD → supply to Curve
+4. Borrow 656 crvUSD from Curve (94% LTV)
+5. Repay flash loan with borrowed crvUSD
 ```
 
-**Final Position (after ~14 loops):**
+**Final Position:**
 ```
 Curve LLAMMA:
-  - Collateral: 769 sreUSD (worth 769 reUSD)
-  - Debt: 730 crvUSD
-  - LTV: 730/769 = 95%
+  - Collateral: 698 sreUSD (worth 698 reUSD)
+  - Debt: 656 crvUSD
+  - LTV: 656/698 = 94%
 
 Resupply:
-  - Collateral: 730 crvUSD
-  - Debt: 672 reUSD
-  - LTV: 672/730 = 92%
+  - Collateral: 650 crvUSD
+  - Debt: 598 reUSD
+  - LTV: 598/650 = 92%
 
-User Equity: 769 - 672 = 97 reUSD (~3% loss to rounding across loops)
+User Equity: 698 - 598 = 100 reUSD
 ```
 
 ### Step 2: User Requests 50% Withdrawal
 
-User wants to withdraw **50 reUSD** (≈50% of their 97 reUSD equity).
+User wants to withdraw **50 reUSD** (50% of their 100 reUSD equity).
 
 ```
-baseFraction = 50 / 97 = 51.5%
+baseFraction = 50 / 100 = 50%
 ```
 
 ### Step 3: Naive Approach (No Multiplier)
 
-With `fractionBps = 51.5%`:
+With `fractionBps = 50%`:
 
 ```
-Step 1: Flash loan 376 crvUSD (51.5% of 730 debt)
+Step 1: Flash loan 328 crvUSD (50% of 656 debt)
 
 Step 2: Repay Curve debt
-        - Repay: 376 crvUSD
-        - Remaining debt: 354 crvUSD
+        - Repay: 328 crvUSD
+        - Remaining debt: 328 crvUSD
 
 Step 3: Withdraw sreUSD from Curve ← HERE'S THE PROBLEM
-        - Total collateral: 769 sreUSD
-        - Remaining debt: 354 crvUSD
-        - At 94% safe LTV, min collateral required: 354 / 0.94 = 377 sreUSD
-        - Withdrawable: 769 - 377 = 392 sreUSD
-        - Expected (proportional): 51.5% × 769 = 396 sreUSD
-        - SHORTFALL: 4 sreUSD (can't withdraw proportionally!)
+        - Total collateral: 698 sreUSD
+        - Remaining debt: 328 crvUSD
+        - At 94% safe LTV, min collateral required: 328 / 0.94 = 349 sreUSD
+        - Withdrawable: 698 - 349 = 349 sreUSD
+        - Expected (proportional): 50% × 698 = 349 sreUSD
+        - Just barely works in this example, but at higher LTVs it fails!
 
 Step 4: Redeem sreUSD → reUSD
-        - 392 sreUSD → 392 reUSD
+        - 349 sreUSD → 349 reUSD
 
 Step 5: Repay Resupply debt (proportional to fractionBps)
-        - Repay: 51.5% × 672 = 346 reUSD
-        - Remaining reUSD: 392 - 346 = 46 reUSD ← USER GETS THIS
+        - Repay: 50% × 598 = 299 reUSD
+        - Remaining reUSD: 349 - 299 = 50 reUSD ← USER GETS THIS
 
 Step 6: Withdraw crvUSD from Resupply
-        - Remaining debt: 326 reUSD
-        - Collateral: 730 crvUSD
-        - At 92% safe LTV, min collateral: 326 / 0.92 = 354 crvUSD
-        - Withdrawable: 730 - 354 = 376 crvUSD
+        - Remaining debt: 299 reUSD
+        - Collateral: 650 crvUSD
+        - At 92% safe LTV, min collateral: 299 / 0.92 = 325 crvUSD
+        - Withdrawable: 650 - 325 = 325 crvUSD
 
 Step 7: Repay flash loan
-        - Owe: 376 crvUSD
-        - Have: 376 crvUSD ✓
+        - Owe: 328 crvUSD
+        - Have: 325 crvUSD
+        - SHORTFALL: 3 crvUSD ❌
 ```
 
 **Result:**
 ```
-User receives: 46 reUSD
-User expected: 50 reUSD
-Shortfall: 4 reUSD (8% loss!)
+Flash loan repayment fails - not enough crvUSD withdrawn from Resupply!
 ```
 
-### Step 4: Why The Loss Occurs
+### Step 4: Why The Failure Occurs
 
-The loss comes from **Step 3: Curve's LTV constraint**.
+The failure comes from **LTV constraints on both protocols**.
 
-When you repay X% of Curve debt, you **cannot** withdraw X% of collateral. You can only withdraw the **excess above minimum collateral** required for the remaining debt:
+When you repay X% of debt, you **cannot** withdraw X% of collateral. You can only withdraw the **excess above minimum collateral** required for the remaining debt:
 
 ```
 withdrawable = totalCollateral - (remainingDebt / safeLTV)
 ```
 
-At 95% LTV with 94% safe LTV:
-- Repay 51.5% of debt → 48.5% remains
-- Min collateral for remaining = 48.5% × debt / 0.94 = 51.6% of original
-- Can only withdraw: 100% - 51.6% = 48.4% (not 51.5%!)
-
-The ~3% gap between what we repaid (51.5%) and what we can withdraw (48.4%) means we get less sreUSD → less reUSD → shortfall after Resupply repayment.
+The gap compounds across both Curve and Resupply, leaving insufficient crvUSD to repay the flash loan.
 
 ### Step 5: The 2x Multiplier Solution
 
@@ -565,79 +352,41 @@ fractionBps = baseFraction * 2;
 **With 2x Multiplier (fractionBps = 100%):**
 
 ```
-Step 1: Flash loan 730 crvUSD (100% of debt)
+Step 1: Flash loan 656 crvUSD (100% of Curve debt)
 
 Step 2: Repay ALL Curve debt
         - Remaining debt: 0 crvUSD
 
 Step 3: Withdraw sreUSD from Curve
         - No LTV constraint (debt = 0)!
-        - Withdraw ALL 769 sreUSD ✓
+        - Withdraw ALL 698 sreUSD ✓
 
 Step 4: Redeem sreUSD → reUSD
-        - 769 sreUSD → 769 reUSD
+        - 698 sreUSD → 698 reUSD
 
 Step 5: Repay Resupply debt (capped at 100%)
-        - Repay: 672 reUSD
-        - Remaining reUSD: 769 - 672 = 97 reUSD
+        - Repay: 598 reUSD
+        - Remaining reUSD: 698 - 598 = 100 reUSD
 
 Step 6: Withdraw crvUSD from Resupply
-        - No debt remaining → withdraw ALL 730 crvUSD
+        - No debt remaining → withdraw ALL 650 crvUSD
 
 Step 7: Repay flash loan
-        - Owe: 730 crvUSD
-        - Have: 730 crvUSD ✓
+        - Owe: 656 crvUSD
+        - Have: 650 crvUSD
+        - Shortfall: 6 crvUSD → covered by swapping some reUSD equity
 ```
 
 **Result:**
 ```
-User receives: 97 reUSD (entire equity freed)
+User receives: ~100 reUSD (entire equity freed, minus swap for shortfall)
 User wanted: 50 reUSD
-Excess: 47 reUSD → parked as scrvUSD buffer for next user
+Excess: ~50 reUSD → parked as scrvUSD buffer for next user
 ```
 
 The 2x multiplier overshoots, but the excess is parked and recovered on the next deposit/withdrawal.
 
-### Why 2x Specifically?
-
-The shortfall percentage depends on how close current LTV is to safe LTV:
-
-| Current LTV | Safe LTV | Repay % | Can Withdraw % | Shortfall |
-|-------------|----------|---------|----------------|-----------|
-| 95% | 94% | 50% | 46.8% | 6.4% |
-| 95% | 94% | 75% | 73.4% | 2.1% |
-| 90% | 94% | 50% | 52.1% | 0% (excess!) |
-
-At high LTV (near liquidation), the shortfall approaches ~8%. The 2x multiplier ensures we always free enough by closing more position than strictly needed.
-
-**Why not calculate the optimal minimum flash amount?**
-
-Theoretically, we could calculate the exact flash amount needed:
-```
-flash = (target + K) / M
-where K = position-specific equity offset (~8 reUSD)
-and M = LTV differential = (1/0.94) - 0.92 = 0.144
-```
-
-We chose simplicity over precision for several reasons:
-
-1. **crvUSD path doesn't care** - The preferred flash loan source (crvUSD ERC-3156) has 0% fee. Flashing 100% vs 55% of debt costs nothing extra.
-
-2. **USDC slippage comes from equity** - When falling back to USDC flash loans, the round-trip swap slippage (~0.02%) is covered from position equity via the shortfall mechanism, not proportional to flash amount.
-
-3. **Failure mode is ugly** - If the optimal calculation is off by even a small margin due to rate changes mid-transaction, the flash loan repayment fails. With 2x, we're always covered.
-
-4. **Gas savings are marginal** - Larger flash amounts don't dramatically increase gas. The overhead is in flash loan routing, not the amount.
-
-5. **Complexity vs benefit** - The math requires solving position-dependent equations with safety buffers. The implementation complexity isn't worth the minimal savings.
-
-The only scenario where optimal calculation would matter: if crvUSD flash liquidity is frequently constrained below the 2x requirement, forcing USDC fallback. In practice, this hasn't been an issue.
-
-### Edge Cases
-
-1. **Full Withdrawal**: `fractionBps` caps at 100% - close entire position
-2. **Low LTV Position**: May free more than needed - excess parked as buffer
-3. **Multiple Users**: Buffer swept on next operation, fairly distributed
+TODO: explain why 2x specifically
 
 ## Yearn V3 Loss Mechanism: Fair Cost Distribution
 
