@@ -438,6 +438,9 @@ contract LoopStrategyForkTest is Test {
         );
         IStrategy(address(strategy)).setKeeper(address(this));
 
+        // Configure flash loans (required for deposits)
+        strategy.setFlashLoanConfig(BALANCER_VAULT, AAVE_V3_POOL, CRVUSD_FLASH_LENDER, USDC, CRVUSD_USDC_POOL, 1, 0);
+
         deal(REUSD, address(this), 10_000e18);
         IERC20(REUSD).approve(address(strategy), 10_000e18);
         IStrategy(address(strategy)).deposit(10_000e18, address(this));

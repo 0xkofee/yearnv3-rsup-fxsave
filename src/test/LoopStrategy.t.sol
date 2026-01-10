@@ -4,9 +4,25 @@ pragma solidity 0.8.18;
 import {Setup} from "./utils/Setup.sol";
 
 import {SreUSDCrvUSDLoopStrategy} from "../SreUSDCrvUSDLoopStrategy.sol";
-import {MockSreUSD, MockCurveLLAMMA, MockResupply} from "./mocks/MockLoopProtocols.sol";
+import {MockSreUSD, MockCurveLLAMMA, MockResupply, MockCrvUSDFlashLender} from "./mocks/MockLoopProtocols.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
+
+/// @notice Harness to expose internal functions for testing
+contract LoopStrategyHarness is SreUSDCrvUSDLoopStrategy {
+    constructor(
+        address _reUSD,
+        address _sreUSD,
+        address _crvUSD,
+        address _curveLLAMMA,
+        address _resupplyPair,
+        string memory _name
+    ) SreUSDCrvUSDLoopStrategy(_reUSD, _sreUSD, _crvUSD, _curveLLAMMA, _resupplyPair, _name) {}
+
+    function exposed_calculateFlashMultiplier(bool forUSDCPath) external view returns (uint256) {
+        return _calculateFlashMultiplier(forUSDCPath);
+    }
+}
 
 contract LoopStrategyTest is Setup {
     SreUSDCrvUSDLoopStrategy public loopStrategy; // For strategy-specific functions
@@ -17,6 +33,7 @@ contract LoopStrategyTest is Setup {
     MockSreUSD public sreUSD;
     MockCurveLLAMMA public curveLLAMMA;
     MockResupply public resupplyPair;
+    MockCrvUSDFlashLender public flashLender;
 
     address public swapper = address(100); // Mock swapper for Resupply
     address public curveZap = address(101); // Mock Zap for Curve
@@ -38,6 +55,7 @@ contract LoopStrategyTest is Setup {
         // Deploy mock protocols
         curveLLAMMA = new MockCurveLLAMMA(address(sreUSD), address(crvUSD));
         resupplyPair = new MockResupply(address(crvUSD), address(reUSD), swapper);
+        flashLender = new MockCrvUSDFlashLender(address(crvUSD));
 
         // Deploy the loop strategy
         loopStrategy = new SreUSDCrvUSDLoopStrategy(
@@ -60,6 +78,21 @@ contract LoopStrategyTest is Setup {
 
         vm.prank(management);
         strategyVault.acceptManagement();
+
+        // Configure flash loan provider (only crvUSD needed for mock tests)
+        // Create dummy token and pool since crvUSD flash will always succeed
+        ERC20Mock dummyUSDC = new ERC20Mock();
+        address dummyPool = address(new ERC20Mock()); // Just needs to be a valid address
+        vm.prank(management);
+        loopStrategy.setFlashLoanConfig(
+            address(0),                 // No Balancer
+            address(0),                 // No Aave
+            address(flashLender),       // crvUSD flash lender
+            address(dummyUSDC),         // Dummy USDC (won't be used)
+            dummyPool,                  // Dummy pool (won't be used)
+            0,                          // crvUSD index
+            1                           // USDC index
+        );
 
         // Mint reUSD to user
         reUSD.mint(user, 20000 ether);
@@ -225,5 +258,99 @@ contract LoopStrategyTest is Setup {
         emit log_named_decimal_uint("sreUSD exchange rate", rate, 18);
 
         emit log("-------------------------");
+    }
+}
+
+contract FlashMultiplierTest is Setup {
+    LoopStrategyHarness public harness;
+
+    ERC20Mock public reUSD;
+    ERC20Mock public crvUSD;
+    MockSreUSD public sreUSD;
+    MockCurveLLAMMA public curveLLAMMA;
+    MockResupply public resupplyPair;
+
+    uint256 public constant BASIS_POINTS = 10000;
+
+    function setUp() public override {
+        super.setUp();
+
+        reUSD = new ERC20Mock();
+        crvUSD = new ERC20Mock();
+        sreUSD = new MockSreUSD(reUSD);
+        curveLLAMMA = new MockCurveLLAMMA(address(sreUSD), address(crvUSD));
+        resupplyPair = new MockResupply(address(crvUSD), address(reUSD), address(100));
+
+        harness = new LoopStrategyHarness(
+            address(reUSD),
+            address(sreUSD),
+            address(crvUSD),
+            address(curveLLAMMA),
+            address(resupplyPair),
+            "Test Harness"
+        );
+    }
+
+    function test_calculateFlashMultiplier_crvUSDPath() public {
+        // Mock returns loan_discount = 2e16 (2%)
+        // curveLTVBuffer = 600 (6%) set in constructor
+        // targetCurveLTV = 10000 - 200 - 600 = 9200 (92%)
+        // targetResupplyLTV = 9200 (92%)
+        // denominator = 10000 - (9200 * 9200 / 10000) = 10000 - 8464 = 1536
+        // maxMultiplier = 9200 * 10000 / 1536 = 59895 (5.99x)
+        // With 93% safety: 59895 * 93 / 100 = 55702 (5.57x)
+
+        uint256 multiplier = harness.exposed_calculateFlashMultiplier(false);
+
+        assertEq(multiplier, 55702, "crvUSD multiplier mismatch");
+    }
+
+    function test_calculateFlashMultiplier_USDCPath() public {
+        // maxMultiplier = 59895
+        // USDC path: 59895 * 90 / 100 = 53905 (5.39x)
+
+        uint256 multiplier = harness.exposed_calculateFlashMultiplier(true);
+
+        assertEq(multiplier, 53905, "USDC multiplier mismatch");
+    }
+
+    function test_calculateFlashMultiplier_Formula() public {
+        // Verify the formula matches expected calculation
+        // loan_discount = 2e16 (2%), curveLTVBuffer = 600 (6%)
+        // targetCurveLTV = 10000 - 200 - 600 = 9200 bps
+        // targetResupplyLTV = 9200 bps
+
+        uint256 targetCurveLTV = 9200;
+        uint256 targetResupplyLTV = 9200;
+
+        // Formula: max = curveLTV / (1 - curveLTV * resupplyLTV)
+        uint256 denominator = BASIS_POINTS - (targetCurveLTV * targetResupplyLTV / BASIS_POINTS);
+        uint256 maxMultiplier = (targetCurveLTV * BASIS_POINTS) / denominator;
+        uint256 expectedCrvUSD = maxMultiplier * 93 / 100;
+
+        uint256 actual = harness.exposed_calculateFlashMultiplier(false);
+
+        assertEq(actual, expectedCrvUSD, "Formula mismatch");
+
+        emit log_named_uint("Expected multiplier", expectedCrvUSD);
+        emit log_named_uint("Actual multiplier", actual);
+    }
+
+    function test_calculateFlashMultiplier_BothPaths() public {
+        uint256 crvUSDMultiplier = harness.exposed_calculateFlashMultiplier(false);
+        uint256 usdcMultiplier = harness.exposed_calculateFlashMultiplier(true);
+
+        // Verify relationship: both derive from same maxMultiplier (59895)
+        // crvUSD = 59895 * 93 / 100 = 55702
+        // USDC = 59895 * 90 / 100 = 53905
+        // Ratio: 55702 / 53905 = 1.0333... (93/90)
+
+        assertEq(crvUSDMultiplier, 55702, "crvUSD multiplier");
+        assertEq(usdcMultiplier, 53905, "USDC multiplier");
+        assertGt(crvUSDMultiplier, usdcMultiplier, "crvUSD should be higher than USDC");
+
+        // Verify the 93/90 ratio
+        // crvUSD * 90 should equal USDC * 93 (within rounding)
+        assertApproxEqAbs(crvUSDMultiplier * 90, usdcMultiplier * 93, 100, "Ratio should be 93:90");
     }
 }

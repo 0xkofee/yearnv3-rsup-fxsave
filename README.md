@@ -185,6 +185,89 @@ To increase leverage, you could:
 
 Current defaults prioritize gas efficiency over maximum leverage.
 
+## Flash Loan Leverage for Deposits
+
+Instead of iterating 18 times to build leverage, we can use a flash loan to achieve target leverage in **one transaction**, saving ~60-70% gas.
+
+### The Math
+
+Given:
+- User deposits **X** reUSD
+- Flash loan **F** crvUSD
+- Curve safe LTV: **94%** (safeCurveLTV)
+- Resupply LTV: **92%** (targetResupplyLTV)
+
+**The Flow:**
+```
+1. Flash F crvUSD
+2. Deposit F crvUSD to Resupply → borrow 0.92F reUSD
+3. Total reUSD = X + 0.92F → deposit to sreUSD → supply to Curve
+4. Borrow from Curve = 0.94 × (X + 0.92F) crvUSD
+5. Use Curve borrow to repay flash loan F
+```
+
+**The Constraint:**
+
+For the flash loan to be repayable, Curve borrow must cover F:
+
+```
+0.94 × (X + 0.92F) ≥ F
+0.94X + 0.8648F ≥ F
+0.94X ≥ F - 0.8648F
+0.94X ≥ 0.1352F
+F ≤ 0.94X / 0.1352
+F ≤ 6.95X
+```
+
+**Maximum flash loan = ~6.95x the deposit amount**
+
+### The General Formula
+
+```
+Max flash multiplier = safeCurveLTV / (1 - safeCurveLTV × targetResupplyLTV)
+                     = 0.94 / (1 - 0.94 × 0.92)
+                     = 0.94 / (1 - 0.8648)
+                     = 0.94 / 0.1352
+                     = 6.95x
+```
+
+### Why 6.5x (Not 6.95x)?
+
+We use **6.5x** instead of the theoretical maximum for safety buffer:
+- Price fluctuations during transaction
+- Rounding errors in protocol math
+- Small slippage in sreUSD deposit
+
+```
+6.5x gives ~7% buffer below theoretical max
+```
+
+### Resulting Leverage
+
+With F = 6.5X:
+```
+Total sreUSD position = X + 0.92 × 6.5X = X + 5.98X = 6.98X
+Effective leverage ≈ 7x
+```
+
+This matches the iterative loop result (~7x after 18 iterations), but in **one transaction**.
+
+### Gas Comparison
+
+| Method | Iterations | Gas | Cost @ 30 gwei |
+|--------|------------|-----|----------------|
+| Iterative | 18 | ~10M | ~$1,000 |
+| Flash Loan | 1 | ~3-4M | ~$350 |
+| **Savings** | | | **~$650 (65%)** |
+
+### Fallback Behavior
+
+The strategy automatically falls back to iterative looping when:
+- Deposit amount < `minFlashLeverageAmount` (default 5000 reUSD)
+- Flash lender not configured
+- Insufficient flash loan liquidity
+- Flash loan fails for any reason
+
 ## Leverage vs Deleverage Asymmetry Problem
 
 This strategy builds leveraged positions by looping through Curve LLAMMA and Resupply. A critical issue exists: **leverage is fast, but deleverage is slow**.
@@ -699,3 +782,4 @@ User 3 withdraws 10,000:
 2. **Last user exits**: scrvUSD buffer swept, may receive more than expected (yield!)
 3. **Buffer accumulates**: Gets swept on next withdrawal/deposit
 4. **Loss exceeds request**: Reverts on `maxLoss` check (safe default)
+

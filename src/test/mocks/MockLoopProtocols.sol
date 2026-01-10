@@ -358,3 +358,66 @@ contract MockResupply {
         // No-op in mock - rewards are simulated by minting tokens directly
     }
 }
+
+/**
+ * @title MockCrvUSDFlashLender
+ * @notice Mock ERC-3156 flash lender for crvUSD
+ * @dev Simulates the Curve crvUSD flash lender (0% fee)
+ */
+interface IERC3156FlashBorrower {
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external returns (bytes32);
+}
+
+contract MockCrvUSDFlashLender {
+    IERC20 public immutable crvUSD;
+
+    constructor(address _crvUSD) {
+        crvUSD = IERC20(_crvUSD);
+    }
+
+    function maxFlashLoan(address token) external view returns (uint256) {
+        if (token == address(crvUSD)) {
+            return type(uint256).max; // Unlimited flash loans
+        }
+        return 0;
+    }
+
+    function flashFee(address, uint256) external pure returns (uint256) {
+        return 0; // 0% fee
+    }
+
+    function flashLoan(
+        address receiver,
+        address token,
+        uint256 amount,
+        bytes calldata data
+    ) external returns (bool) {
+        require(token == address(crvUSD), "Only crvUSD");
+
+        // Mint crvUSD to borrower
+        ERC20Mock(address(crvUSD)).mint(receiver, amount);
+
+        // Call borrower's callback
+        bytes32 result = IERC3156FlashBorrower(receiver).onFlashLoan(
+            msg.sender,
+            token,
+            amount,
+            0, // No fee
+            data
+        );
+        require(result == keccak256("ERC3156FlashBorrower.onFlashLoan"), "Invalid return");
+
+        // Borrower should have transferred crvUSD back to us
+        // In real implementation, Curve checks balance. We'll burn it.
+        uint256 balance = crvUSD.balanceOf(address(this));
+        require(balance >= amount, "Flash loan not repaid");
+
+        return true;
+    }
+}
